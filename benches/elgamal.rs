@@ -1,13 +1,10 @@
 use ark_std::test_rng;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use ezkl::circuit::modules::elgamal::{
-    ElGamalConfig, ElGamalGadget, ElGamalVariables, NUM_INSTANCE_COLUMNS,
-};
+use ezkl::circuit::modules::elgamal::{ElGamalConfig, ElGamalGadget, ElGamalVariables};
 use ezkl::circuit::modules::Module;
 use ezkl::circuit::*;
-use ezkl::execute::create_proof_circuit_kzg;
-use ezkl::graph::modules::{ELGAMAL_CONSTRAINTS_ESTIMATE, ELGAMAL_FIXED_COST_ESTIMATE};
 use ezkl::pfsys::create_keys;
+use ezkl::pfsys::create_proof_circuit_kzg;
 use ezkl::pfsys::srs::gen_srs;
 use ezkl::pfsys::TranscriptType;
 use ezkl::tensor::*;
@@ -38,7 +35,7 @@ impl Circuit<Fr> for EncryptytionCircuit {
     }
 
     fn configure(cs: &mut ConstraintSystem<Fr>) -> Self::Config {
-        ElGamalGadget::configure(cs)
+        ElGamalGadget::configure(cs, ())
     }
 
     fn synthesize(
@@ -50,11 +47,7 @@ impl Circuit<Fr> for EncryptytionCircuit {
         chip.load_variables(self.variables.clone());
         let sk: Tensor<ValType<Fr>> =
             Tensor::new(Some(&[Value::known(self.variables.sk).into()]), &[1]).unwrap();
-        chip.layout(
-            &mut layouter,
-            &[self.message.clone(), sk.into()],
-            vec![0; NUM_INSTANCE_COLUMNS],
-        )?;
+        chip.layout(&mut layouter, &[self.message.clone(), sk.into()], 0)?;
         Ok(())
     }
 }
@@ -65,9 +58,7 @@ fn runelgamal(c: &mut Criterion) {
     for size in [784, 2352, 12288].iter() {
         let mut rng = test_rng();
 
-        let k = ((size * ELGAMAL_CONSTRAINTS_ESTIMATE + ELGAMAL_FIXED_COST_ESTIMATE) as f32)
-            .log2()
-            .ceil() as u32;
+        let k = (ElGamalGadget::num_rows(*size) as f32).log2().ceil() as u32;
         let params = gen_srs::<KZGCommitmentScheme<_>>(k);
 
         let var = ElGamalVariables::gen_random(&mut rng);
@@ -106,11 +97,12 @@ fn runelgamal(c: &mut Criterion) {
                 let prover = create_proof_circuit_kzg(
                     circuit.clone(),
                     &params,
-                    public_inputs.clone(),
+                    Some(public_inputs[0].clone()),
                     &pk,
-                    TranscriptType::Blake,
+                    TranscriptType::EVM,
                     SingleStrategy::new(&params),
                     CheckMode::UNSAFE,
+                    None,
                 );
                 prover.unwrap();
             });

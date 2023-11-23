@@ -8,7 +8,6 @@ pub mod poseidon_params;
 pub mod spec;
 
 // This chip adds a set of advice columns to the gadget Chip to store the inputs of the hash
-// compared to `hash_with_instance` this version doesn't use any instance column.
 use halo2_gadgets::poseidon::{primitives::*, Hash, Pow5Chip, Pow5Config};
 use halo2_proofs::arithmetic::Field;
 use halo2_proofs::halo2curves::bn256::Fr as Fp;
@@ -82,11 +81,46 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
 }
 
 impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, const L: usize>
+    PoseidonChip<S, WIDTH, RATE, L>
+{
+    /// Configuration of the PoseidonChip
+    pub fn configure_with_optional_instance(
+        meta: &mut ConstraintSystem<Fp>,
+        instance: Option<Column<Instance>>,
+    ) -> PoseidonConfig<WIDTH, RATE> {
+        //  instantiate the required columns
+        let hash_inputs = (0..WIDTH).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        for input in &hash_inputs {
+            meta.enable_equality(*input);
+        }
+
+        let partial_sbox = meta.advice_column();
+        let rc_a = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
+        let rc_b = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
+
+        for input in hash_inputs.iter().take(WIDTH) {
+            meta.enable_equality(*input);
+        }
+        meta.enable_constant(rc_b[0]);
+
+        Self::configure_with_cols(
+            meta,
+            partial_sbox,
+            rc_a.try_into().unwrap(),
+            rc_b.try_into().unwrap(),
+            hash_inputs,
+            instance,
+        )
+    }
+}
+
+impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, const L: usize>
     Module<Fp> for PoseidonChip<S, WIDTH, RATE, L>
 {
     type Config = PoseidonConfig<WIDTH, RATE>;
     type InputAssignments = InputAssignments;
     type RunInputs = Vec<Fp>;
+    type Params = ();
 
     fn name(&self) -> &'static str {
         "Poseidon"
@@ -103,8 +137,9 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
             _marker: PhantomData,
         }
     }
+
     /// Configuration of the PoseidonChip
-    fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
+    fn configure(meta: &mut ConstraintSystem<Fp>, _: Self::Params) -> Self::Config {
         //  instantiate the required columns
         let hash_inputs = (0..WIDTH).map(|_| meta.advice_column()).collect::<Vec<_>>();
         for input in &hash_inputs {
@@ -161,16 +196,30 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
                                     y,
                                     || *v,
                                 ),
-                                ValType::PrevAssigned(v) => Ok(v.clone()),
-                                _ => panic!("wrong input type, must be previously assigned"),
+                                ValType::PrevAssigned(v) | ValType::AssignedConstant(v, ..) => {
+                                    Ok(v.clone())
+                                }
+                                ValType::Constant(f) => region.assign_advice_from_constant(
+                                    || format!("load message_{}", i),
+                                    self.config.hash_inputs[x],
+                                    y,
+                                    *f,
+                                ),
+                                e => {
+                                    panic!("wrong input type {:?}, must be previously assigned", e)
+                                }
                             }
                         })
                         .collect(),
                     ValTensor::Instance {
-                        inner: col, dims, ..
+                        dims,
+                        inner: col,
+                        idx,
+                        initial_offset,
+                        ..
                     } => {
                         // this should never ever fail
-                        let num_elems = dims.iter().product::<usize>();
+                        let num_elems = dims[*idx].iter().product::<usize>();
                         (0..num_elems)
                             .map(|i| {
                                 let x = i % WIDTH;
@@ -178,7 +227,7 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
                                 region.assign_advice_from_instance(
                                     || "pub input anchor",
                                     *col,
-                                    i,
+                                    initial_offset + i,
                                     self.config.hash_inputs[x],
                                     y,
                                 )
@@ -216,18 +265,19 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
         &self,
         layouter: &mut impl Layouter<Fp>,
         input: &[ValTensor<Fp>],
-        row_offset: Vec<usize>,
+        row_offset: usize,
     ) -> Result<ValTensor<Fp>, Error> {
         let (mut input_cells, zero_val) = self.layout_inputs(layouter, input)?;
         // extract the values from the input cells
-        let assigned_input: Tensor<ValType<Fp>> =
+        let mut assigned_input: Tensor<ValType<Fp>> =
             input_cells.iter().map(|e| ValType::from(e.clone())).into();
         let len = assigned_input.len();
 
         let start_time = instant::Instant::now();
 
+        let mut one_iter = false;
         // do the Tree dance baby
-        while input_cells.len() > 1 {
+        while input_cells.len() > 1 || !one_iter {
             let hashes: Result<Vec<AssignedCell<Fp, Fp>>, Error> = input_cells
                 .chunks(L)
                 .enumerate()
@@ -238,7 +288,7 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
                     let remainder = block.len() % L;
 
                     if remainder != 0 {
-                        block.extend(vec![zero_val.clone(); L - remainder].into_iter());
+                        block.extend(vec![zero_val.clone(); L - remainder]);
                     }
 
                     let pow5_chip = Pow5Chip::construct(self.config.pow5_config.clone());
@@ -261,6 +311,8 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
                 })
                 .collect();
 
+            log::trace!("hashes (N={:?}) took: {:?}", len, start_time.elapsed());
+            one_iter = true;
             input_cells = hashes?;
         }
 
@@ -281,7 +333,7 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
                     let expected_var = region.assign_advice_from_instance(
                         || "pub input anchor",
                         instance,
-                        row_offset[0],
+                        row_offset,
                         self.config.hash_inputs[0],
                         0,
                     )?;
@@ -289,6 +341,8 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
                     region.constrain_equal(output.cell(), expected_var.cell())
                 },
             )?;
+
+            assigned_input.reshape(input[0].dims());
 
             Ok(assigned_input.into())
         } else {
@@ -299,12 +353,14 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
     ///
     fn run(message: Vec<Fp>) -> Result<Vec<Vec<Fp>>, Box<dyn std::error::Error>> {
         let mut hash_inputs = message;
+
         let len = hash_inputs.len();
 
         let start_time = instant::Instant::now();
 
+        let mut one_iter = false;
         // do the Tree dance baby
-        while hash_inputs.len() > 1 {
+        while hash_inputs.len() > 1 || !one_iter {
             let hashes: Vec<Fp> = hash_inputs
                 .par_chunks(L)
                 .map(|block| {
@@ -324,7 +380,7 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
                     .hash(block.clone().try_into().unwrap())
                 })
                 .collect();
-
+            one_iter = true;
             hash_inputs = hashes;
         }
 
@@ -333,10 +389,32 @@ impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, con
 
         Ok(vec![hash_inputs])
     }
+
+    fn num_rows(mut input_len: usize) -> usize {
+        // this was determined by running the circuit and looking at the number of constraints
+        // in the test called hash_for_a_range_of_input_sizes, then regressing in python to find the slope
+        let fixed_cost: usize = 41 * L;
+
+        let mut num_rows = 0;
+
+        loop {
+            // the number of times the input_len is divisible by L
+            let num_chunks = input_len / L + 1;
+            num_rows += num_chunks * fixed_cost;
+            if num_chunks == 1 {
+                break;
+            }
+            input_len = num_chunks;
+        }
+
+        num_rows
+    }
 }
 
 #[allow(unused)]
 mod tests {
+
+    use crate::circuit::modules::ModulePlanner;
 
     use super::{
         spec::{PoseidonSpec, POSEIDON_RATE, POSEIDON_WIDTH},
@@ -363,7 +441,7 @@ mod tests {
 
     impl<S: Spec<Fp, WIDTH, RATE>, const L: usize> Circuit<Fp> for HashCircuit<S, L> {
         type Config = PoseidonConfig<WIDTH, RATE>;
-        type FloorPlanner = SimpleFloorPlanner;
+        type FloorPlanner = ModulePlanner;
         type Params = ();
 
         fn without_witnesses(&self) -> Self {
@@ -377,7 +455,7 @@ mod tests {
         }
 
         fn configure(meta: &mut ConstraintSystem<Fp>) -> PoseidonConfig<WIDTH, RATE> {
-            PoseidonChip::<PoseidonSpec, WIDTH, RATE, L>::configure(meta)
+            PoseidonChip::<PoseidonSpec, WIDTH, RATE, L>::configure(meta, ())
         }
 
         fn synthesize(
@@ -386,11 +464,8 @@ mod tests {
             mut layouter: impl Layouter<Fp>,
         ) -> Result<(), Error> {
             let chip: PoseidonChip<PoseidonSpec, WIDTH, RATE, L> = PoseidonChip::new(config);
-            chip.layout(
-                &mut layouter,
-                &[self.message.clone()],
-                vec![0; NUM_INSTANCE_COLUMNS],
-            )?;
+            chip.layout(&mut layouter, &[self.message.clone()], 0)?;
+
             Ok(())
         }
     }
@@ -411,7 +486,7 @@ mod tests {
             _spec: PhantomData,
         };
         let prover = halo2_proofs::dev::MockProver::run(k, &circuit, output).unwrap();
-        assert_eq!(prover.verify(), Ok(()))
+        assert_eq!(prover.verify_par(), Ok(()))
     }
 
     #[test]
@@ -430,7 +505,41 @@ mod tests {
             _spec: PhantomData,
         };
         let prover = halo2_proofs::dev::MockProver::run(k, &circuit, output).unwrap();
-        assert_eq!(prover.verify(), Ok(()))
+        assert_eq!(prover.verify_par(), Ok(()))
+    }
+
+    #[test]
+    #[ignore]
+    fn hash_for_a_range_of_input_sizes() {
+        let rng = rand::rngs::OsRng;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        env_logger::init();
+
+        {
+            let i = 32;
+            // print a bunch of new lines
+            println!(
+                "i is {} -------------------------------------------------",
+                i
+            );
+
+            let message: Vec<Fp> = (0..i).map(|_| Fp::random(rng)).collect::<Vec<_>>();
+            let output =
+                PoseidonChip::<PoseidonSpec, WIDTH, RATE, 32>::run(message.clone()).unwrap();
+
+            let mut message: Tensor<ValType<Fp>> =
+                message.into_iter().map(|m| Value::known(m).into()).into();
+
+            let k = 17;
+            let circuit = HashCircuit::<PoseidonSpec, 32> {
+                message: message.into(),
+                _spec: PhantomData,
+            };
+            let prover = halo2_proofs::dev::MockProver::run(k, &circuit, output).unwrap();
+
+            assert_eq!(prover.verify_par(), Ok(()))
+        }
     }
 
     #[test]
@@ -451,6 +560,6 @@ mod tests {
             _spec: PhantomData,
         };
         let prover = halo2_proofs::dev::MockProver::run(k, &circuit, output).unwrap();
-        assert_eq!(prover.verify(), Ok(()))
+        assert_eq!(prover.verify_par(), Ok(()))
     }
 }

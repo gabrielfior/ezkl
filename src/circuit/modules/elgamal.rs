@@ -54,7 +54,7 @@ pub const POSEIDON_LEN: usize = 2;
 /// A chip implementing ElGamal encryption.
 pub struct ElGamalChip {
     /// The configuration for this chip.
-    config: ElGamalConfig,
+    pub config: ElGamalConfig,
     /// The ECC chip.
     ecc: BaseFieldEccChip<G1Affine, NUMBER_OF_LIMBS, BIT_LEN_LIMB>,
     /// The Poseidon hash chip.
@@ -71,7 +71,10 @@ pub struct ElGamalConfig {
     poseidon_config: PoseidonConfig<POSEIDON_WIDTH, POSEIDON_RATE>,
     add_config: AddConfig,
     plaintext_col: Column<Advice>,
-    ciphertext_c1_exp_col: Column<Instance>,
+    /// The column used for the instance.
+    pub instance: Column<Instance>,
+    /// The config has been initialized.
+    pub initialized: bool,
 }
 
 impl ElGamalConfig {
@@ -115,7 +118,7 @@ impl ElGamalChip {
         let main_gate_config = MainGate::<Fr>::configure(meta);
         let advices = main_gate_config.advices();
         let main_fixed_columns = main_gate_config.fixed();
-        let ciphertext_c1_exp_col = main_gate_config.instance();
+        let instance = main_gate_config.instance();
 
         let rc_a = main_fixed_columns[3..5].try_into().unwrap();
         let rc_b = [meta.fixed_column(), meta.fixed_column()];
@@ -154,12 +157,13 @@ impl ElGamalChip {
             range_config,
             add_config,
             plaintext_col,
-            ciphertext_c1_exp_col,
+            instance,
+            initialized: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// The variables used in the ElGamal circuit.
 pub struct ElGamalVariables {
     /// The randomness used in the encryption.
@@ -205,7 +209,7 @@ impl ElGamalVariables {
 
         // compute secret_key*generator to derive the public key
         // With BN256, we create the private key from a random number. This is a private key value (sk
-        //  and a public key mapped to the G2 curve:: pk=sk.G2
+        // and a public key mapped to the G2 curve:: pk=sk.G2
         let mut pk = G1::generator();
         pk.mul_assign(sk);
 
@@ -219,11 +223,20 @@ impl ElGamalVariables {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The cipher returned from the ElGamal encryption.
+pub struct ElGamalCipher {
+    /// c1 := r*G
+    pub c1: G1,
+    /// c2 := m*s
+    pub c2: Vec<Fr>,
+}
+
 #[derive(Debug, Clone)]
 /// A gadget implementing ElGamal encryption.
 pub struct ElGamalGadget {
     /// The configuration for this gadget.
-    config: ElGamalConfig,
+    pub config: ElGamalConfig,
     /// The variables used in this gadget.
     variables: Option<ElGamalVariables>,
 }
@@ -240,7 +253,7 @@ impl ElGamalGadget {
     }
 
     /// Encrypt a message using the public key.
-    pub fn encrypt(pk: G1Affine, msg: Vec<Fr>, r: Fr) -> (G1, Vec<Fr>) {
+    pub fn encrypt(pk: G1Affine, msg: Vec<Fr>, r: Fr) -> ElGamalCipher {
         let g = G1Affine::generator();
         let c1 = g.mul(&r);
 
@@ -260,7 +273,7 @@ impl ElGamalGadget {
             c2.push(m + dh);
         }
 
-        (c1, c2)
+        ElGamalCipher { c1, c2 }
     }
 
     /// Hash the msssage to be used as a public input.
@@ -276,9 +289,9 @@ impl ElGamalGadget {
     }
 
     /// Decrypt a ciphertext using the secret key.
-    pub fn decrypt(cipher: &(G1, Vec<Fr>), sk: Fr) -> Vec<Fr> {
-        let c1 = cipher.0;
-        let c2 = cipher.1.clone();
+    pub fn decrypt(cipher: &ElGamalCipher, sk: Fr) -> Vec<Fr> {
+        let c1 = cipher.c1;
+        let c2 = cipher.c2.clone();
 
         let s = c1.mul(sk).to_affine().coordinates().unwrap();
 
@@ -299,9 +312,9 @@ impl ElGamalGadget {
     }
 
     /// Get the public inputs for the circuit.
-    pub fn get_instances(cipher: &(G1, Vec<Fr>), sk_hash: Fr) -> Vec<Vec<Fr>> {
+    pub fn get_instances(cipher: &ElGamalCipher, sk_hash: Fr) -> Vec<Vec<Fr>> {
         let mut c1_and_sk = cipher
-            .0
+            .c1
             .to_affine()
             .coordinates()
             .map(|c| {
@@ -314,7 +327,7 @@ impl ElGamalGadget {
 
         c1_and_sk.push(sk_hash);
 
-        c1_and_sk.push(Self::hash_encrypted_msg(cipher.1.clone()));
+        c1_and_sk.push(Self::hash_encrypted_msg(cipher.c2.clone()));
 
         vec![c1_and_sk]
     }
@@ -335,7 +348,7 @@ impl ElGamalGadget {
             chip.poseidon.layout(
                 &mut layouter.namespace(|| "Poseidon hash (encrypted_msg)"),
                 &[poseidon_message.into()],
-                vec![],
+                0,
             )?
         };
 
@@ -367,7 +380,7 @@ impl ElGamalGadget {
             chip.poseidon.layout(
                 &mut layouter.namespace(|| "Poseidon hash (sk)"),
                 &[poseidon_message.into()],
-                vec![],
+                0,
             )?
         };
 
@@ -401,7 +414,7 @@ impl ElGamalGadget {
         let s = variables.pk.mul(variables.r).to_affine();
         let c1 = g.mul(variables.r).to_affine();
 
-        let (s, c1) = layouter.assign_region(
+        layouter.assign_region(
             || "obtain_s",
             |region| {
                 let offset = 0;
@@ -419,10 +432,9 @@ impl ElGamalGadget {
 
                 chip.ecc.assert_equal(ctx, &s, &s_from_sk)?;
 
-                Ok((s, c1))
+                Ok([s, c1])
             },
-        )?;
-        Ok([s, c1])
+        )
     }
 
     pub(crate) fn verify_encryption(
@@ -447,7 +459,7 @@ impl ElGamalGadget {
             chip.poseidon.layout(
                 &mut layouter.namespace(|| "Poseidon hasher"),
                 &[poseidon_message.into()],
-                vec![0],
+                0,
             )?
         };
 
@@ -471,6 +483,7 @@ impl Module<Fr> for ElGamalGadget {
     type Config = ElGamalConfig;
     type InputAssignments = (Vec<AssignedCell<Fr, Fr>>, AssignedCell<Fr, Fr>);
     type RunInputs = (Vec<Fr>, ElGamalVariables);
+    type Params = ();
 
     fn new(config: Self::Config) -> Self {
         Self {
@@ -479,7 +492,7 @@ impl Module<Fr> for ElGamalGadget {
         }
     }
 
-    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+    fn configure(meta: &mut ConstraintSystem<Fr>, _: Self::Params) -> Self::Config {
         ElGamalChip::configure(meta)
     }
 
@@ -533,21 +546,33 @@ impl Module<Fr> for ElGamalGadget {
                                 i,
                                 || *v,
                             ),
-                            ValType::PrevAssigned(v) => Ok(v.clone()),
-                            _ => panic!("wrong input type, must be previously assigned"),
+                            ValType::PrevAssigned(v) | ValType::AssignedConstant(v, ..) => {
+                                Ok(v.clone())
+                            }
+                            ValType::Constant(f) => region.assign_advice_from_constant(
+                                || format!("load message_{}", i),
+                                self.config.plaintext_col,
+                                i,
+                                *f,
+                            ),
+                            e => panic!("wrong input type {:?}, must be previously assigned", e),
                         })
                         .collect(),
                     ValTensor::Instance {
-                        inner: col, dims, ..
+                        dims,
+                        inner: col,
+                        idx,
+                        initial_offset,
+                        ..
                     } => {
                         // this should never ever fail
-                        let num_elems = dims.iter().product::<usize>();
+                        let num_elems = dims[*idx].iter().product::<usize>();
                         (0..num_elems)
                             .map(|i| {
                                 region.assign_advice_from_instance(
                                     || "pub input anchor",
                                     *col,
-                                    i,
+                                    initial_offset + i,
                                     self.config.plaintext_col,
                                     i,
                                 )
@@ -561,14 +586,16 @@ impl Module<Fr> for ElGamalGadget {
                     _ => panic!("wrong input type"),
                 };
 
+                let msg_var = msg_var?;
+
                 let sk_var = region.assign_advice(
                     || "sk",
                     self.config.plaintext_col,
-                    message.len(),
+                    msg_var.len(),
                     || sk,
                 )?;
 
-                Ok((msg_var?, sk_var))
+                Ok((msg_var, sk_var))
             },
         )?;
         let duration = start_time.elapsed();
@@ -581,16 +608,14 @@ impl Module<Fr> for ElGamalGadget {
         &self,
         layouter: &mut impl Layouter<Fr>,
         inputs: &[ValTensor<Fr>],
-        row_offsets: Vec<usize>,
+        row_offset: usize,
     ) -> Result<ValTensor<Fr>, Error> {
         let start_time = instant::Instant::now();
 
         // if all equivalent to 0, then we are in the first row of the circuit
-        if row_offsets.iter().all(|&x| x == 0) {
-            self.config.config_range(layouter)?;
+        if !self.config.initialized {
+            self.config.config_range(layouter).unwrap();
         }
-
-        let row_offset = row_offsets[0];
 
         let (msg_var, sk_var) = self.layout_inputs(layouter, inputs)?;
 
@@ -610,17 +635,17 @@ impl Module<Fr> for ElGamalGadget {
         layouter
             .constrain_instance(
                 c1.x().native().cell(),
-                self.config.ciphertext_c1_exp_col,
+                self.config.instance,
                 C1_X + row_offset,
             )
             .and(layouter.constrain_instance(
                 c1.y().native().cell(),
-                self.config.ciphertext_c1_exp_col,
+                self.config.instance,
                 C1_Y + row_offset,
             ))
             .and(layouter.constrain_instance(
                 sk_hash.cell(),
-                self.config.ciphertext_c1_exp_col,
+                self.config.instance,
                 SK_H + row_offset,
             ))?;
 
@@ -644,14 +669,12 @@ impl Module<Fr> for ElGamalGadget {
             &c2,
         )?;
 
-        layouter.constrain_instance(
-            c2_hash.cell(),
-            self.config.ciphertext_c1_exp_col,
-            C2_H + row_offset,
-        )?;
+        layouter.constrain_instance(c2_hash.cell(), self.config.instance, C2_H + row_offset)?;
 
-        let assigned_input: Tensor<ValType<Fr>> =
+        let mut assigned_input: Tensor<ValType<Fr>> =
             msg_var.iter().map(|e| ValType::from(e.clone())).into();
+
+        assigned_input.reshape(inputs[0].dims());
 
         log::trace!(
             "layout (N={:?}) took: {:?}",
@@ -661,13 +684,47 @@ impl Module<Fr> for ElGamalGadget {
 
         Ok(assigned_input.into())
     }
+
+    fn num_rows(input_len: usize) -> usize {
+        // this was determined by running the circuit and looking at the number of constraints
+        // in the test called hash_for_a_range_of_input_sizes, then regressing in python to find the slope
+        // ```python
+        // import numpy as np
+        // x = [1, 2, 3, 512, 513, 514]
+        // y = [75424, 75592, 75840, 161017, 161913, 162000]
+        // def fit_above(x, y) :
+        //     x0, y0 = x[0] - 1, y[0]
+        //     x -= x0
+        //     y -= y0
+        //     def error_function_2(b, x, y) :
+        //         a = np.min((y - b) / x)
+        //         return np.sum((y - a * x - b)**2)
+        //     b = scipy.optimize.minimize(error_function_2, [0], args=(x, y)).x[0]
+        //     a = np.max((y - b) / x)
+        //     return a, b - a * x0 + y0
+        // a, b = fit_above(x, y)
+        // plt.plot(x, y, 'o')
+        // plt.plot(x, a*x + b, '-')
+        // plt.show()
+        // for (x_i, y_i) in zip(x,y):
+        // assert y_i <= a*x_i + b
+        // print(a, b)
+        // ```
+        const NUM_CONSTRAINTS_SLOPE: usize = 196;
+        const NUM_CONSTRAINTS_INTERCEPT: usize = 75257;
+
+        // check if even or odd
+        input_len * NUM_CONSTRAINTS_SLOPE + NUM_CONSTRAINTS_INTERCEPT
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::circuit::modules::ModulePlanner;
+
     use super::*;
     use ark_std::test_rng;
-    use halo2_proofs::{circuit::SimpleFloorPlanner, dev::MockProver, plonk::Circuit};
+    use halo2_proofs::{dev::MockProver, plonk::Circuit};
 
     struct EncryptionCircuit {
         message: ValTensor<Fr>,
@@ -676,7 +733,7 @@ mod tests {
 
     impl Circuit<Fr> for EncryptionCircuit {
         type Config = ElGamalConfig;
-        type FloorPlanner = SimpleFloorPlanner;
+        type FloorPlanner = ModulePlanner;
         type Params = ();
 
         fn without_witnesses(&self) -> Self {
@@ -692,7 +749,7 @@ mod tests {
         }
 
         fn configure(meta: &mut ConstraintSystem<Fr>) -> ElGamalConfig {
-            ElGamalGadget::configure(meta)
+            ElGamalGadget::configure(meta, ())
         }
 
         fn synthesize(
@@ -704,13 +761,24 @@ mod tests {
             chip.load_variables(self.variables.clone());
             let sk: Tensor<ValType<Fr>> =
                 Tensor::new(Some(&[Value::known(self.variables.sk).into()]), &[1]).unwrap();
-            chip.layout(
-                &mut layouter,
-                &[self.message.clone(), sk.into()],
-                vec![0; NUM_INSTANCE_COLUMNS],
-            )?;
+            chip.layout(&mut layouter, &[self.message.clone(), sk.into()], 0)?;
             Ok(())
         }
+    }
+
+    #[test]
+    // this is for backwards compatibility with the old format
+    fn test_variables_serialization_round_trip() {
+        let mut rng = test_rng();
+
+        let var = ElGamalVariables::gen_random(&mut rng);
+
+        let mut buf = vec![];
+        serde_json::to_writer(&mut buf, &var).unwrap();
+
+        let var2 = serde_json::from_reader(&buf[..]).unwrap();
+
+        assert_eq!(var, var2);
     }
 
     #[test]
@@ -756,5 +824,39 @@ mod tests {
 
         let res = MockProver::run(17, &circuit, public_inputs).unwrap();
         res.assert_satisfied_par();
+    }
+
+    #[test]
+    #[ignore]
+    pub fn test_circuit_range_of_input_sizes() {
+        let mut rng = test_rng();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        env_logger::init();
+
+        //
+        for i in [1, 2, 3, 512, 513, 514, 1024] {
+            println!("i is {} ----------------------------------------", i);
+
+            let var = ElGamalVariables::gen_random(&mut rng);
+            let mut msg = vec![];
+            for _ in 0..i {
+                msg.push(Fr::random(&mut rng));
+            }
+
+            let run_inputs = (msg.clone(), var.clone());
+            let public_inputs: Vec<Vec<Fr>> = ElGamalGadget::run(run_inputs).unwrap();
+
+            let message: Tensor<ValType<Fr>> =
+                msg.into_iter().map(|m| Value::known(m).into()).into();
+
+            let circuit = EncryptionCircuit {
+                message: message.into(),
+                variables: var,
+            };
+
+            let res = MockProver::run(19, &circuit, public_inputs).unwrap();
+            res.assert_satisfied_par();
+        }
     }
 }

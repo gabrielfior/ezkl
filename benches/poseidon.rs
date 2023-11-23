@@ -1,11 +1,10 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ezkl::circuit::modules::poseidon::spec::{PoseidonSpec, POSEIDON_RATE, POSEIDON_WIDTH};
-use ezkl::circuit::modules::poseidon::{PoseidonChip, PoseidonConfig, NUM_INSTANCE_COLUMNS};
+use ezkl::circuit::modules::poseidon::{PoseidonChip, PoseidonConfig};
 use ezkl::circuit::modules::Module;
 use ezkl::circuit::*;
-use ezkl::execute::create_proof_circuit_kzg;
-use ezkl::graph::modules::{POSEIDOIN_FIXED_COST_ESTIMATE, POSEIDON_CONSTRAINTS_ESTIMATE};
 use ezkl::pfsys::create_keys;
+use ezkl::pfsys::create_proof_circuit_kzg;
 use ezkl::pfsys::srs::gen_srs;
 use ezkl::pfsys::TranscriptType;
 use ezkl::tensor::*;
@@ -37,7 +36,7 @@ impl Circuit<Fr> for MyCircuit {
     }
 
     fn configure(cs: &mut ConstraintSystem<Fr>) -> Self::Config {
-        PoseidonChip::<PoseidonSpec, POSEIDON_WIDTH, POSEIDON_RATE, 10>::configure(cs)
+        PoseidonChip::<PoseidonSpec, POSEIDON_WIDTH, POSEIDON_RATE, 10>::configure(cs, ())
     }
 
     fn synthesize(
@@ -47,11 +46,7 @@ impl Circuit<Fr> for MyCircuit {
     ) -> Result<(), Error> {
         let chip: PoseidonChip<PoseidonSpec, POSEIDON_WIDTH, POSEIDON_RATE, L> =
             PoseidonChip::new(config);
-        chip.layout(
-            &mut layouter,
-            &[self.image.clone()],
-            vec![0; NUM_INSTANCE_COLUMNS],
-        )?;
+        chip.layout(&mut layouter, &[self.image.clone()], 0)?;
         Ok(())
     }
 }
@@ -60,7 +55,8 @@ fn runposeidon(c: &mut Criterion) {
     let mut group = c.benchmark_group("poseidon");
 
     for size in [64, 784, 2352, 12288].iter() {
-        let k = ((size * POSEIDON_CONSTRAINTS_ESTIMATE + POSEIDOIN_FIXED_COST_ESTIMATE) as f32)
+        let k = (PoseidonChip::<PoseidonSpec, POSEIDON_WIDTH, POSEIDON_RATE, L>::num_rows(*size)
+            as f32)
             .log2()
             .ceil() as u32;
         let params = gen_srs::<KZGCommitmentScheme<_>>(k);
@@ -94,11 +90,12 @@ fn runposeidon(c: &mut Criterion) {
                 let prover = create_proof_circuit_kzg(
                     circuit.clone(),
                     &params,
-                    output.clone(),
+                    Some(output[0].clone()),
                     &pk,
-                    TranscriptType::Blake,
+                    TranscriptType::EVM,
                     SingleStrategy::new(&params),
                     CheckMode::UNSAFE,
+                    None,
                 );
                 prover.unwrap();
             });

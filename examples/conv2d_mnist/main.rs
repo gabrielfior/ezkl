@@ -6,7 +6,7 @@ use ezkl::fieldutils;
 use ezkl::fieldutils::i32_to_felt;
 use ezkl::tensor::*;
 use halo2_proofs::dev::MockProver;
-use halo2_proofs::poly::kzg::multiopen::VerifierGWC;
+use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
@@ -17,7 +17,6 @@ use halo2_proofs::{
         commitment::ParamsProver,
         kzg::{
             commitment::{KZGCommitmentScheme, ParamsKZG},
-            multiopen::ProverGWC,
             strategy::SingleStrategy,
         },
     },
@@ -36,12 +35,14 @@ use std::marker::PhantomData;
 mod params;
 
 const K: usize = 20;
+const NUM_INNER_COLS: usize = 1;
 
 #[derive(Clone)]
 struct Config<
     const LEN: usize, //LEN = CHOUT x OH x OW flattened //not supported yet in rust stable
     const CLASSES: usize,
-    const BITS: usize,
+    const LOOKUP_MIN: i128,
+    const LOOKUP_MAX: i128,
     // Convolution
     const KERNEL_HEIGHT: usize,
     const KERNEL_WIDTH: usize,
@@ -64,7 +65,8 @@ struct Config<
 struct MyCircuit<
     const LEN: usize, //LEN = CHOUT x OH x OW flattened
     const CLASSES: usize,
-    const BITS: usize,
+    const LOOKUP_MIN: i128,
+    const LOOKUP_MAX: i128,
     // Convolution
     const KERNEL_HEIGHT: usize,
     const KERNEL_WIDTH: usize,
@@ -87,7 +89,8 @@ struct MyCircuit<
 impl<
         const LEN: usize,
         const CLASSES: usize,
-        const BITS: usize,
+        const LOOKUP_MIN: i128,
+        const LOOKUP_MAX: i128,
         // Convolution
         const KERNEL_HEIGHT: usize,
         const KERNEL_WIDTH: usize,
@@ -101,7 +104,8 @@ impl<
     for MyCircuit<
         LEN,
         CLASSES,
-        BITS,
+        LOOKUP_MIN,
+        LOOKUP_MAX,
         KERNEL_HEIGHT,
         KERNEL_WIDTH,
         OUT_CHANNELS,
@@ -117,7 +121,8 @@ where
     type Config = Config<
         LEN,
         CLASSES,
-        BITS,
+        LOOKUP_MIN,
+        LOOKUP_MAX,
         KERNEL_HEIGHT,
         KERNEL_WIDTH,
         OUT_CHANNELS,
@@ -137,17 +142,41 @@ where
     // Here we wire together the layers by using the output advice in each layer as input advice in the next (not with copying / equality).
     // This can be automated but we will sometimes want skip connections, etc. so we need the flexibility.
     fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-        let input = VarTensor::new_advice(cs, K, LEN);
-        let params = VarTensor::new_advice(cs, K, LEN);
-        let output = VarTensor::new_advice(cs, K, LEN);
+        let input = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN);
+        let params = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN);
+        let output = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN);
 
         println!("INPUT COL {:#?}", input);
 
-        let mut layer_config =
-            PolyConfig::configure(cs, &[input.clone(), params], &output, CheckMode::SAFE);
+        let mut layer_config = PolyConfig::configure(
+            cs,
+            &[input.clone(), params.clone()],
+            &output,
+            CheckMode::SAFE,
+        );
 
         layer_config
-            .configure_lookup(cs, &input, &output, BITS, &LookupOp::ReLU { scale: 32 })
+            .configure_lookup(
+                cs,
+                &input,
+                &output,
+                &params,
+                (LOOKUP_MIN, LOOKUP_MAX),
+                K,
+                &LookupOp::ReLU,
+            )
+            .unwrap();
+
+        layer_config
+            .configure_lookup(
+                cs,
+                &input,
+                &output,
+                &params,
+                (LOOKUP_MIN, LOOKUP_MAX),
+                K,
+                &LookupOp::Div { denom: 32.0.into() },
+            )
             .unwrap();
 
         let public_output: Column<Instance> = cs.instance_column();
@@ -170,12 +199,12 @@ where
             .assign_region(
                 || "mlp_4d",
                 |region| {
-                    let mut region = RegionCtx::new(region, 0);
+                    let mut region = RegionCtx::new(region, 0, NUM_INNER_COLS);
 
                     let op = PolyOp::Conv {
                         kernel: self.l0_params[0].clone(),
                         bias: Some(self.l0_params[1].clone()),
-                        padding: (PADDING, PADDING),
+                        padding: [(PADDING, PADDING); 2],
                         stride: (STRIDE, STRIDE),
                     };
                     let x = config
@@ -183,15 +212,21 @@ where
                         .layout(&mut region, &[self.input.clone()], Box::new(op))
                         .unwrap();
 
+                    let x = config
+                        .layer_config
+                        .layout(&mut region, &[x.unwrap()], Box::new(LookupOp::ReLU))
+                        .unwrap();
+
                     let mut x = config
                         .layer_config
                         .layout(
                             &mut region,
                             &[x.unwrap()],
-                            Box::new(LookupOp::ReLU { scale: 32 }),
+                            Box::new(LookupOp::Div { denom: 32.0.into() }),
                         )
                         .unwrap()
                         .unwrap();
+
                     x.flatten();
                     // multiply by weights
                     let x = config
@@ -210,10 +245,8 @@ where
                         .layer_config
                         .layout(
                             &mut region,
-                            &[x],
-                            Box::new(PolyOp::Add {
-                                a: Some(self.l2_params[1].clone()),
-                            }),
+                            &[x, self.l2_params[1].clone().into()],
+                            Box::new(PolyOp::Add),
                         )
                         .unwrap()
                         .unwrap();
@@ -241,6 +274,7 @@ where
 }
 
 pub fn runconv() {
+    #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
 
     const KERNEL_HEIGHT: usize = 5;
@@ -307,10 +341,10 @@ pub fn runconv() {
     );
 
     l0_kernels.reshape(&[OUT_CHANNELS, IN_CHANNELS, KERNEL_HEIGHT, KERNEL_WIDTH]);
-    l0_kernels.set_visibility(ezkl::graph::Visibility::Private);
+    l0_kernels.set_visibility(&ezkl::graph::Visibility::Private);
 
     let mut l0_bias = Tensor::<F>::from((0..OUT_CHANNELS).map(|_| fieldutils::i32_to_felt(0)));
-    l0_bias.set_visibility(ezkl::graph::Visibility::Private);
+    l0_bias.set_visibility(&ezkl::graph::Visibility::Private);
 
     let mut l2_biases = Tensor::<F>::from(myparams.biases.into_iter().map(|fl| {
         let dx = fl * 32_f32;
@@ -318,7 +352,7 @@ pub fn runconv() {
         let integral: i32 = unsafe { rounded.to_int_unchecked() };
         fieldutils::i32_to_felt(integral)
     }));
-    l2_biases.set_visibility(ezkl::graph::Visibility::Private);
+    l2_biases.set_visibility(&ezkl::graph::Visibility::Private);
     l2_biases.reshape(&[l2_biases.len(), 1]);
 
     let mut l2_weights = Tensor::<F>::from(myparams.weights.into_iter().flatten().map(|fl| {
@@ -327,13 +361,14 @@ pub fn runconv() {
         let integral: i32 = unsafe { rounded.to_int_unchecked() };
         fieldutils::i32_to_felt(integral)
     }));
-    l2_weights.set_visibility(ezkl::graph::Visibility::Private);
+    l2_weights.set_visibility(&ezkl::graph::Visibility::Private);
     l2_weights.reshape(&[CLASSES, LEN]);
 
     let circuit = MyCircuit::<
         LEN,
         10,
-        16,
+        -32768,
+        32768,
         KERNEL_HEIGHT,
         KERNEL_WIDTH,
         OUT_CHANNELS,
@@ -347,23 +382,6 @@ pub fn runconv() {
         l0_params: [l0_kernels, l0_bias],
         l2_params: [l2_weights, l2_biases],
     };
-
-    #[cfg(feature = "dev-graph")]
-    {
-        println!("Plotting");
-        use plotters::prelude::*;
-
-        let root = BitMapBackend::new("conv2dmnist-layout.png", (2048, 7680)).into_drawing_area();
-        root.fill(&WHITE).unwrap();
-        let root = root
-            .titled("Conv -> ReLU -> Affine -> ReLU", ("sans-serif", 60))
-            .unwrap();
-
-        halo2_proofs::dev::CircuitLayout::default()
-            .render(13, &circuit, &root)
-            .unwrap();
-        return;
-    }
 
     let public_input: Tensor<i32> = vec![
         -25124i32, -19304, -16668, -4399, -6209, -4548, -2317, -8349, -6117, -23461,
@@ -429,7 +447,7 @@ pub fn runconv() {
     let now = Instant::now();
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
     let mut rng = OsRng;
-    create_proof::<KZGCommitmentScheme<_>, ProverGWC<_>, _, _, _, _>(
+    create_proof::<KZGCommitmentScheme<_>, ProverSHPLONK<_>, _, _, _, _>(
         &params,
         &pk,
         &[circuit],
@@ -449,7 +467,7 @@ pub fn runconv() {
     let now = Instant::now();
     let strategy = SingleStrategy::new(&params);
     let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
-    let verify = verify_proof::<_, VerifierGWC<_>, _, _, _>(
+    let verify = verify_proof::<_, VerifierSHPLONK<_>, _, _, _>(
         &params,
         pk.get_vk(),
         strategy,

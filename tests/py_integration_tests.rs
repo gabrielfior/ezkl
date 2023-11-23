@@ -19,9 +19,14 @@ mod py_tests {
         static ref ANVIL_URL: String = "http://localhost:3030".to_string();
     }
 
-    fn start_anvil() -> Child {
+    fn start_anvil(limitless: bool) -> Child {
+        let mut args = vec!["-p", "3030"];
+        if limitless {
+            args.push("--code-size-limit=41943040");
+            args.push("--disable-block-gas-limit");
+        }
         let child = Command::new("anvil")
-            .args(["-p", "3030"])
+            .args(args)
             // .stdout(Stdio::piped())
             .spawn()
             .expect("failed to start anvil process");
@@ -56,19 +61,26 @@ mod py_tests {
             let status = Command::new("pip")
                 .args([
                     "install",
-                    "torch",
-                    "pandas",
-                    "numpy",
-                    "seaborn",
-                    "jupyter",
-                    "onnx",
-                    "kaggle",
-                    "py-solc-x",
-                    "web3",
-                    "librosa",
-                    "keras",
-                    "tensorflow",
-                    "tf2onnx",
+                    "torch==2.0.1",
+                    "pandas==2.0.3",
+                    "numpy==1.23",
+                    "seaborn==0.12.2",
+                    "jupyter==1.0.0",
+                    "onnx==1.14.0",
+                    "kaggle==1.5.15",
+                    "py-solc-x==1.1.1",
+                    "web3==6.5.0",
+                    "librosa==0.10.0.post2",
+                    "keras==2.12.0",
+                    "tensorflow==2.12.0",
+                    "tensorflow-datasets==4.9.3",
+                    "tf2onnx==1.14.0",
+                    "pytorch-lightning==2.0.6",
+                    "sk2torch==1.2.0",
+                    "scikit-learn==1.3.1",
+                    "xgboost==1.7.6",
+                    "hummingbird-ml==0.4.9",
+                    "lightgbm==4.0.0",
                 ])
                 .status()
                 .expect("failed to execute process");
@@ -104,13 +116,45 @@ mod py_tests {
         }
     }
 
-    const TESTS: [&str; 6] = [
+    const TESTS: [&str; 37] = [
+        "mnist_gan.ipynb",
+        // "mnist_vae.ipynb",
         "keras_simple_demo.ipynb",
         "encrypted_vis.ipynb",
         "hashed_vis.ipynb",
-        "simple_demo.ipynb",
+        "simple_demo_all_public.ipynb",
         "data_attest.ipynb",
         "variance.ipynb",
+        "mean_postgres.ipynb",
+        "little_transformer.ipynb",
+        "simple_demo_aggregated_proofs.ipynb",
+        "ezkl_demo.ipynb",
+        "lstm.ipynb",
+        "set_membership.ipynb",
+        "decision_tree.ipynb",
+        "random_forest.ipynb",
+        "gradient_boosted_trees.ipynb",
+        "xgboost.ipynb",
+        "lightgbm.ipynb",
+        "svm.ipynb",
+        "simple_demo_public_input_output.ipynb",
+        "simple_demo_public_network_output.ipynb",
+        "gcn.ipynb",
+        "linear_regression.ipynb",
+        "stacked_regression.ipynb",
+        "data_attest_hashed.ipynb",
+        "simple_hub_demo.ipynb",
+        "kzg_vis.ipynb",
+        "kmeans.ipynb",
+        "solvency.ipynb",
+        "proof_splitting.ipynb",
+        "mnist_gan_proof_splitting.ipynb",
+        "sklearn_mlp.ipynb",
+        "generalized_inverse.ipynb",
+        "mnist_classifier.ipynb",
+        "world_rotation.ipynb",
+        "tictactoe_binary_classification.ipynb",
+        "tictactoe_autoencoder.ipynb",
     ];
 
     macro_rules! test_func {
@@ -123,13 +167,17 @@ mod py_tests {
             use super::*;
 
 
-            seq!(N in 0..=5 {
+            seq!(N in 0..=34 {
 
             #(#[test_case(TESTS[N])])*
             fn run_notebook_(test: &str) {
                 crate::py_tests::init_binary();
-                let mut anvil_child = crate::py_tests::start_anvil();
-                let test_dir: TempDir = TempDir::new("example").unwrap();
+                let mut limitless = false;
+                if test == TESTS[5] {
+                    limitless = true;
+                }
+                let mut anvil_child = crate::py_tests::start_anvil(limitless);
+                let test_dir: TempDir = TempDir::new("nb").unwrap();
                 let path = test_dir.path().to_str().unwrap();
                 crate::py_tests::mv_test_(path, test);
                 run_notebook(path, test);
@@ -139,9 +187,9 @@ mod py_tests {
             #[test]
             fn voice_notebook_() {
                 crate::py_tests::init_binary();
-                let mut anvil_child = crate::py_tests::start_anvil();
+                let mut anvil_child = crate::py_tests::start_anvil(false);
                 crate::py_tests::download_voice_data();
-                let test_dir: TempDir = TempDir::new("example").unwrap();
+                let test_dir: TempDir = TempDir::new("voice_judge").unwrap();
                 let path = test_dir.path().to_str().unwrap();
                 crate::py_tests::mv_test_(path, "voice_judge.ipynb");
                 run_notebook(path, "voice_judge.ipynb");
@@ -149,6 +197,16 @@ mod py_tests {
                 anvil_child.kill().unwrap();
             }
 
+            #[test]
+            fn nbeats_notebook_() {
+                crate::py_tests::init_binary();
+                let test_dir: TempDir = TempDir::new("nbeats").unwrap();
+                let path = test_dir.path().to_str().unwrap();
+                crate::py_tests::mv_test_(path, "nbeats_timeseries_forecasting.ipynb");
+                crate::py_tests::mv_test_(path, "eth_price.csv");
+                run_notebook(path, "nbeats_timeseries_forecasting.ipynb");
+                test_dir.close().unwrap();
+            }
             });
 
     }

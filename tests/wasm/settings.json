@@ -2,32 +2,44 @@
     "run_args": {
         "tolerance": {
             "val": 0.0,
-            "scales": [
-                1,
+            "scale": 1.0
+        },
+        "num_inner_cols": 1,
+        "input_scale": 2,
+        "param_scale": 2,
+        "scale_rebase_multiplier": 1,
+        "lookup_range": [
+            -32,
+            12
+        ],
+        "logrows": 6,
+        "variables": [
+            [
+                "batch_size",
                 1
             ]
-        },
-        "scale": 0,
-        "bits": 5,
-        "logrows": 7,
-        "batch_size": 1,
+        ],
         "input_visibility": "Private",
         "output_visibility": "Public",
-        "param_visibility": "Private",
-        "allocated_constraints": null
+        "param_visibility": "Private"
     },
-    "version": "0.0.0-git",
-    "num_constraints": 24,
-    "model_output_scales": [
-        7
-    ],
+    "total_assignments": 31,
+    "num_rows": 31,
+    "total_const_size": 0,
     "model_instance_shapes": [
         [
             1,
             4
         ]
     ],
+    "model_output_scales": [
+        2
+    ],
+    "model_input_scales": [
+        2
+    ],
     "module_sizes": {
+        "kzg": [],
         "poseidon": [
             0,
             [
@@ -37,18 +49,19 @@
         "elgamal": [
             0,
             [
-                0,
-                0,
                 0
             ]
         ]
     },
     "required_lookups": [
         {
-            "ReLU": {
-                "scale": 1
+            "Div": {
+                "denom": 4.0
             }
-        }
+        },
+        "ReLU"
     ],
-    "check_mode": "SAFE"
+    "check_mode": "UNSAFE",
+    "version": "0.0.0",
+    "num_blinding_factors": null
 }

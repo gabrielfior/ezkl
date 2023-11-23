@@ -3,7 +3,7 @@ use ezkl::circuit::*;
 
 use ezkl::circuit::lookup::LookupOp;
 use ezkl::circuit::poly::PolyOp;
-use ezkl::execute::create_proof_circuit_kzg;
+use ezkl::pfsys::create_proof_circuit_kzg;
 use ezkl::pfsys::TranscriptType;
 use ezkl::pfsys::{create_keys, srs::gen_srs};
 use ezkl::tensor::*;
@@ -16,7 +16,7 @@ use halo2_proofs::{
 use halo2curves::bn256::{Bn256, Fr};
 use std::marker::PhantomData;
 
-const BITS: usize = 8;
+const BITS: (i128, i128) = (-32768, 32768);
 static mut LEN: usize = 4;
 const K: usize = 16;
 
@@ -44,16 +44,16 @@ impl Circuit<Fr> for MyCircuit {
     fn configure(cs: &mut ConstraintSystem<Fr>) -> Self::Config {
         let len = unsafe { LEN };
 
-        let a = VarTensor::new_advice(cs, K, len);
-        let b = VarTensor::new_advice(cs, K, len);
-        let output = VarTensor::new_advice(cs, K, len);
+        let a = VarTensor::new_advice(cs, K, 1, len);
+        let b = VarTensor::new_advice(cs, K, 1, len);
+        let output = VarTensor::new_advice(cs, K, 1, len);
 
         let mut base_config =
-            BaseConfig::configure(cs, &[a, b.clone()], &output, CheckMode::UNSAFE);
+            BaseConfig::configure(cs, &[a.clone(), b.clone()], &output, CheckMode::UNSAFE);
 
         // sets up a new relu table
         base_config
-            .configure_lookup(cs, &b, &output, BITS, &LookupOp::ReLU { scale: 1 })
+            .configure_lookup(cs, &b, &output, &a, BITS, K, &LookupOp::ReLU)
             .unwrap();
 
         MyConfig { base_config }
@@ -71,18 +71,14 @@ impl Circuit<Fr> for MyCircuit {
                 let op = PolyOp::Einsum {
                     equation: "ij,jk->ik".to_string(),
                 };
-                let mut region = region::RegionCtx::new(region, 0);
+                let mut region = region::RegionCtx::new(region, 0, 1);
                 let output = config
                     .base_config
                     .layout(&mut region, &self.inputs, Box::new(op))
                     .unwrap();
                 let _output = config
                     .base_config
-                    .layout(
-                        &mut region,
-                        &[output.unwrap()],
-                        Box::new(LookupOp::ReLU { scale: 1 }),
-                    )
+                    .layout(&mut region, &[output.unwrap()], Box::new(LookupOp::ReLU))
                     .unwrap();
                 Ok(())
             },
@@ -129,11 +125,12 @@ fn runmatmul(c: &mut Criterion) {
                 let prover = create_proof_circuit_kzg(
                     circuit.clone(),
                     &params,
-                    vec![],
+                    None,
                     &pk,
-                    TranscriptType::Blake,
+                    TranscriptType::EVM,
                     SingleStrategy::new(&params),
                     CheckMode::SAFE,
+                    None,
                 );
                 prover.unwrap();
             });

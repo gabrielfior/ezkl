@@ -1,21 +1,23 @@
+use crate::circuit::InputType;
 use crate::fieldutils::i128_to_felt;
-use crate::pfsys::field_to_vecu64;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::tensor::Tensor;
 use halo2curves::bn256::Fr as Fp;
+#[cfg(not(target_arch = "wasm32"))]
+use postgres::{Client, NoTls};
 #[cfg(feature = "python-bindings")]
 use pyo3::prelude::*;
 #[cfg(feature = "python-bindings")]
 use pyo3::types::PyDict;
 #[cfg(feature = "python-bindings")]
 use pyo3::ToPyObject;
-// use serde::de::{Visitor, MapAccess};
-// use serde::de::{Visitor, MapAccess};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::tensor::Tensor;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-// use std::collections::HashMap;
 use std::io::Read;
-// use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
+use tract_onnx::tract_hir::tract_num_traits::ToPrimitive;
 
 use super::quantize_float;
 use super::GraphError;
@@ -27,10 +29,27 @@ type RPCUrl = String;
 ///
 #[derive(Clone, Debug, PartialOrd, PartialEq)]
 pub enum FileSourceInner {
-    /// Inner elements of inputs coming from a file
+    /// Inner elements of float inputs coming from a file
     Float(f64),
+    /// Inner elements of bool inputs coming from a file
+    Bool(bool),
     /// Inner elements of inputs coming from a witness
     Field(Fp),
+}
+
+impl FileSourceInner {
+    ///
+    pub fn is_float(&self) -> bool {
+        matches!(self, FileSourceInner::Float(_))
+    }
+    ///
+    pub fn is_bool(&self) -> bool {
+        matches!(self, FileSourceInner::Bool(_))
+    }
+    ///
+    pub fn is_field(&self) -> bool {
+        matches!(self, FileSourceInner::Field(_))
+    }
 }
 
 impl Serialize for FileSourceInner {
@@ -39,7 +58,8 @@ impl Serialize for FileSourceInner {
         S: Serializer,
     {
         match self {
-            FileSourceInner::Field(data) => field_to_vecu64(data).serialize(serializer),
+            FileSourceInner::Field(data) => data.serialize(serializer),
+            FileSourceInner::Bool(data) => data.serialize(serializer),
             FileSourceInner::Float(data) => data.serialize(serializer),
         }
     }
@@ -54,14 +74,17 @@ impl<'de> Deserialize<'de> for FileSourceInner {
     {
         let this_json: Box<serde_json::value::RawValue> = Deserialize::deserialize(deserializer)?;
 
-        let first_try: Result<f64, _> = serde_json::from_str(this_json.get());
-
-        if let Ok(t) = first_try {
+        let bool_try: Result<bool, _> = serde_json::from_str(this_json.get());
+        if let Ok(t) = bool_try {
+            return Ok(FileSourceInner::Bool(t));
+        }
+        let float_try: Result<f64, _> = serde_json::from_str(this_json.get());
+        if let Ok(t) = float_try {
             return Ok(FileSourceInner::Float(t));
         }
-        let second_try: Result<[u64; 4], _> = serde_json::from_str(this_json.get());
-        if let Ok(t) = second_try {
-            return Ok(FileSourceInner::Field(Fp::from_raw(t)));
+        let field_try: Result<Fp, _> = serde_json::from_str(this_json.get());
+        if let Ok(t) = field_try {
+            return Ok(FileSourceInner::Field(t));
         }
 
         Err(serde::de::Error::custom(
@@ -82,11 +105,31 @@ impl FileSourceInner {
     pub fn new_field(f: Fp) -> Self {
         FileSourceInner::Field(f)
     }
+    /// Create a new FileSourceInner
+    pub fn new_bool(f: bool) -> Self {
+        FileSourceInner::Bool(f)
+    }
+
+    ///
+    pub fn as_type(&mut self, input_type: &InputType) {
+        match self {
+            FileSourceInner::Float(f) => input_type.roundtrip(f),
+            FileSourceInner::Bool(_) => assert!(matches!(input_type, InputType::Bool)),
+            FileSourceInner::Field(_) => {}
+        }
+    }
 
     /// Convert to a field element
-    pub fn to_field(&self, scale: u32) -> Fp {
+    pub fn to_field(&self, scale: crate::Scale) -> Fp {
         match self {
             FileSourceInner::Float(f) => i128_to_felt(quantize_float(f, 0.0, scale).unwrap()),
+            FileSourceInner::Bool(f) => {
+                if *f {
+                    Fp::one()
+                } else {
+                    Fp::zero()
+                }
+            }
             FileSourceInner::Field(f) => *f,
         }
     }
@@ -94,6 +137,13 @@ impl FileSourceInner {
     pub fn to_float(&self) -> f64 {
         match self {
             FileSourceInner::Float(f) => *f,
+            FileSourceInner::Bool(f) => {
+                if *f {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             FileSourceInner::Field(f) => crate::fieldutils::felt_to_i128(*f) as f64,
         }
     }
@@ -115,34 +165,136 @@ impl OnChainSource {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+/// Inner elements of inputs/outputs coming from postgres DB
+#[derive(Clone, Debug, Deserialize, Serialize, Default, PartialOrd, PartialEq)]
+pub struct PostgresSource {
+    /// postgres host
+    pub host: RPCUrl,
+    /// user to connect to postgres
+    pub user: String,
+    /// password to connect to postgres
+    pub password: String,
+    /// query to execute
+    pub query: String,
+    /// dbname
+    pub dbname: String,
+    /// port
+    pub port: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PostgresSource {
+    /// Create a new PostgresSource
+    pub fn new(
+        host: RPCUrl,
+        port: String,
+        user: String,
+        query: String,
+        dbname: String,
+        password: String,
+    ) -> Self {
+        PostgresSource {
+            host,
+            user,
+            password,
+            query,
+            dbname,
+            port,
+        }
+    }
+
+    /// Fetch data from postgres
+    pub fn fetch(&self) -> Result<Vec<Vec<pg_bigdecimal::PgNumeric>>, Box<dyn std::error::Error>> {
+        // clone to move into thread
+        let user = self.user.clone();
+        let host = self.host.clone();
+        let query = self.query.clone();
+        let dbname = self.dbname.clone();
+        let port = self.port.clone();
+        let password = self.password.clone();
+
+        let config = if password.is_empty() {
+            format!(
+                "host={} user={} dbname={} port={}",
+                host, user, dbname, port
+            )
+        } else {
+            format!(
+                "host={} user={} dbname={} port={} password={}",
+                host, user, dbname, port, password
+            )
+        };
+
+        let res: Vec<pg_bigdecimal::PgNumeric> = thread::spawn(move || {
+            let mut client = Client::connect(&config, NoTls).unwrap();
+            let mut res: Vec<pg_bigdecimal::PgNumeric> = Vec::new();
+            // extract rows from query
+            for row in client.query(&query, &[]).unwrap() {
+                // extract features from row
+                for i in 0..row.len() {
+                    res.push(row.get(i));
+                }
+            }
+            res
+        })
+        .join()
+        .map_err(|_| "failed to fetch data from postgres")?;
+
+        Ok(vec![res])
+    }
+
+    /// Fetch data from postgres and format it as a FileSource
+    pub fn fetch_and_format_as_file(
+        &self,
+    ) -> Result<Vec<Vec<FileSourceInner>>, Box<dyn std::error::Error>> {
+        Ok(self
+            .fetch()?
+            .iter()
+            .map(|d| {
+                d.iter()
+                    .map(|d| {
+                        FileSourceInner::Float(
+                            d.n.as_ref()
+                                .unwrap()
+                                .to_f64()
+                                .ok_or("could not convert decimal to f64")
+                                .unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+}
+
 impl OnChainSource {
     #[cfg(not(target_arch = "wasm32"))]
     /// Create dummy local on-chain data to test the OnChain data source
     pub async fn test_from_file_data(
         data: &FileSource,
-        scales: Vec<u32>,
-        shapes: Vec<Vec<usize>>,
+        scales: Vec<crate::Scale>,
+        mut shapes: Vec<Vec<usize>>,
         rpc: Option<&str>,
     ) -> Result<(Vec<Tensor<Fp>>, Self), Box<dyn std::error::Error>> {
         use crate::eth::{evm_quantize, read_on_chain_inputs, test_on_chain_data};
-        use crate::graph::scale_to_multiplier;
-        use itertools::Itertools;
         use log::debug;
 
         // Set up local anvil instance for reading on-chain data
-        let (anvil, client) = crate::eth::setup_eth_backend(rpc).await?;
+        let (anvil, client) = crate::eth::setup_eth_backend(rpc, None).await?;
 
         let address = client.address();
 
-        let scales: Vec<f64> = scales.into_iter().map(scale_to_multiplier).collect();
+        let mut scales = scales;
+        // set scales to 1 where data is a field element
+        for (idx, i) in data.iter().enumerate() {
+            if i.iter().all(|e| e.is_field()) {
+                scales[idx] = 0;
+                shapes[idx] = vec![i.len()];
+            }
+        }
 
-        // unquantize data
-        let float_data = data
-            .iter()
-            .map(|t| t.iter().map(|e| (e.to_float() as f32)).collect_vec())
-            .collect::<Vec<Vec<f32>>>();
-
-        let calls_to_accounts = test_on_chain_data(client.clone(), &float_data).await?;
+        let calls_to_accounts = test_on_chain_data(client.clone(), data).await?;
         debug!("Calls to accounts: {:?}", calls_to_accounts);
         let inputs = read_on_chain_inputs(client.clone(), address, &calls_to_accounts).await?;
         debug!("Inputs: {:?}", inputs);
@@ -167,7 +319,7 @@ impl OnChainSource {
 
         // on-chain data has already been quantized at this point. Just need to reshape it and push into tensor vector
         let mut inputs: Vec<Tensor<Fp>> = vec![];
-        for (input, shape) in vec![quantized_evm_inputs].iter().zip(shapes) {
+        for (input, shape) in [quantized_evm_inputs].iter().zip(shapes) {
             let mut t: Tensor<Fp> = input.iter().cloned().collect();
             t.reshape(&shape);
             inputs.push(t);
@@ -206,7 +358,11 @@ pub enum DataSource {
     File(FileSource),
     /// On-chain data source. The first element is the calls to the account, and the second is the RPC url.
     OnChain(OnChainSource),
+    /// Postgres DB
+    #[cfg(not(target_arch = "wasm32"))]
+    DB(PostgresSource),
 }
+
 impl Default for DataSource {
     fn default() -> Self {
         DataSource::File(vec![vec![]])
@@ -263,6 +419,13 @@ impl<'de> Deserialize<'de> for DataSource {
         if let Ok(t) = second_try {
             return Ok(DataSource::OnChain(t));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let third_try: Result<PostgresSource, _> = serde_json::from_str(this_json.get());
+            if let Ok(t) = third_try {
+                return Ok(DataSource::DB(t));
+            }
+        }
 
         Err(serde::de::Error::custom("failed to deserialize DataSource"))
     }
@@ -289,7 +452,8 @@ impl GraphData {
 
     /// Load the model input from a file
     pub fn from_path(path: std::path::PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut file = std::fs::File::open(path)?;
+        let mut file = std::fs::File::open(path.clone())
+            .map_err(|_| format!("failed to open input at {}", path.display()))?;
         let mut data = String::new();
         file.read_to_string(&mut data)?;
         serde_json::from_str(&data).map_err(|e| e.into())
@@ -303,7 +467,6 @@ impl GraphData {
     ///
     pub fn split_into_batches(
         &self,
-        batch_size: usize,
         input_shapes: Vec<Vec<usize>>,
     ) -> Result<Vec<Self>, Box<dyn std::error::Error>> {
         // split input data into batches
@@ -313,33 +476,47 @@ impl GraphData {
             GraphData {
                 input_data: DataSource::File(data),
                 output_data: _,
-            } => data,
-            _ => {
-                todo!("on-chain data batching not implemented yet")
-            }
+            } => data.clone(),
+            GraphData {
+                input_data: DataSource::OnChain(_),
+                output_data: _,
+            } => todo!("on-chain data batching not implemented yet"),
+            #[cfg(not(target_arch = "wasm32"))]
+            GraphData {
+                input_data: DataSource::DB(data),
+                output_data: _,
+            } => data.fetch_and_format_as_file()?,
         };
 
-        for (i, input) in iterable.iter().enumerate() {
-            // ensure the input is devenly divisible by batch_size
-            if input.len() % batch_size != 0 {
+        for (i, shape) in input_shapes.iter().enumerate() {
+            // ensure the input is evenly divisible by batch_size
+            let input_size = shape.clone().iter().product::<usize>();
+            let input = &iterable[i];
+            if input.len() % input_size != 0 {
                 return Err(Box::new(GraphError::InvalidDims(
                     0,
-                    "input data length must be evenly divisible by batch size".to_string(),
+                    "calibration data length must be evenly divisible by the original input_size"
+                        .to_string(),
                 )));
             }
-            let input_size = input_shapes[i].clone().iter().product::<usize>();
             let mut batches = vec![];
-            for batch in input.chunks(batch_size * input_size) {
+            for batch in input.chunks(input_size) {
                 batches.push(batch.to_vec());
             }
             batched_inputs.push(batches);
         }
+
         // now merge all the batches for each input into a vector of batches
         // first assert each input has the same number of batches
-        let num_batches = batched_inputs[0].len();
-        for input in batched_inputs.iter() {
-            assert_eq!(input.len(), num_batches);
-        }
+        let num_batches = if batched_inputs.is_empty() {
+            0
+        } else {
+            let num_batches = batched_inputs[0].len();
+            for input in batched_inputs.iter() {
+                assert_eq!(input.len(), num_batches);
+            }
+            num_batches
+        };
         // now merge the batches
         let mut input_batches = vec![];
         for i in 0..num_batches {
@@ -348,6 +525,10 @@ impl GraphData {
                 batch.push(input[i].clone());
             }
             input_batches.push(DataSource::File(batch));
+        }
+
+        if input_batches.is_empty() {
+            input_batches.push(DataSource::File(vec![vec![]]));
         }
 
         // create a new GraphWitness for each batch
@@ -381,15 +562,26 @@ impl ToPyObject for DataSource {
                 dict.set_item("calls_to_accounts", &source.calls).unwrap();
                 dict.to_object(py)
             }
+            DataSource::DB(source) => {
+                let dict = PyDict::new(py);
+                dict.set_item("host", &source.host).unwrap();
+                dict.set_item("user", &source.user).unwrap();
+                dict.set_item("query", &source.query).unwrap();
+                dict.to_object(py)
+            }
         }
     }
 }
 
 #[cfg(feature = "python-bindings")]
+use crate::pfsys::field_to_vecu64_montgomery;
+
+#[cfg(feature = "python-bindings")]
 impl ToPyObject for FileSourceInner {
     fn to_object(&self, py: Python) -> PyObject {
         match self {
-            FileSourceInner::Field(data) => field_to_vecu64(data).to_object(py),
+            FileSourceInner::Field(data) => field_to_vecu64_montgomery(data).to_object(py),
+            FileSourceInner::Bool(data) => data.to_object(py),
             FileSourceInner::Float(data) => data.to_object(py),
         }
     }

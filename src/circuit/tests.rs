@@ -41,9 +41,9 @@ mod matmul {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN * LEN);
-            let b = VarTensor::new_advice(cs, K, LEN * LEN);
-            let output = VarTensor::new_advice(cs, K, LEN * LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN * LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN * LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN * LEN);
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
 
@@ -56,7 +56,7 @@ mod matmul {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
@@ -90,16 +90,17 @@ mod matmul {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
 #[cfg(test)]
-mod matmul_col_overflow {
+mod matmul_col_overflow_double_col {
     use super::*;
 
     const K: usize = 5;
     const LEN: usize = 6;
+    const NUM_INNER_COLS: usize = 2;
 
     #[derive(Clone)]
     struct MatmulCircuit<F: PrimeField + TensorType + PartialOrd> {
@@ -117,9 +118,9 @@ mod matmul_col_overflow {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN * LEN * LEN);
-            let b = VarTensor::new_advice(cs, K, LEN * LEN * LEN);
-            let output = VarTensor::new_advice(cs, K, LEN * LEN * LEN);
+            let a = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN * LEN * LEN);
+            let b = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN * LEN * LEN);
+            let output = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN * LEN * LEN);
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
 
@@ -132,7 +133,7 @@ mod matmul_col_overflow {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, NUM_INNER_COLS);
                         config
                             .layout(
                                 &mut region,
@@ -164,7 +165,310 @@ mod matmul_col_overflow {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
+    }
+}
+
+#[cfg(test)]
+mod matmul_col_overflow {
+    use super::*;
+
+    const K: usize = 5;
+    const LEN: usize = 6;
+
+    #[derive(Clone)]
+    struct MatmulCircuit<F: PrimeField + TensorType + PartialOrd> {
+        inputs: [ValTensor<F>; 2],
+        _marker: PhantomData<F>,
+    }
+
+    impl Circuit<F> for MatmulCircuit<F> {
+        type Config = BaseConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = TestParams;
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
+            let a = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
+        }
+
+        fn synthesize(
+            &self,
+            mut config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            layouter
+                .assign_region(
+                    || "",
+                    |region| {
+                        let mut region = RegionCtx::new(region, 0, 1);
+                        config
+                            .layout(
+                                &mut region,
+                                &self.inputs.clone(),
+                                Box::new(PolyOp::Einsum {
+                                    equation: "ij,jk->ik".to_string(),
+                                }),
+                            )
+                            .map_err(|_| Error::Synthesis)
+                    },
+                )
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn matmulcircuit() {
+        // parameters
+        let mut a = Tensor::from((0..LEN * LEN).map(|i| Value::known(F::from((i + 1) as u64))));
+        a.reshape(&[LEN, LEN]);
+
+        let mut w = Tensor::from((0..LEN).map(|i| Value::known(F::from((i + 1) as u64))));
+        w.reshape(&[LEN, 1]);
+
+        let circuit = MatmulCircuit::<F> {
+            inputs: [ValTensor::from(a), ValTensor::from(w)],
+            _marker: PhantomData,
+        };
+
+        let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
+        prover.assert_satisfied_par();
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod matmul_col_ultra_overflow_double_col {
+    use halo2_proofs::poly::commitment::ParamsProver;
+
+    use super::*;
+
+    const K: usize = 4;
+    const LEN: usize = 20;
+    const NUM_INNER_COLS: usize = 2;
+
+    #[derive(Clone)]
+    struct MatmulCircuit<F: PrimeField + TensorType + PartialOrd> {
+        inputs: [ValTensor<F>; 2],
+        _marker: PhantomData<F>,
+    }
+
+    impl Circuit<F> for MatmulCircuit<F> {
+        type Config = BaseConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = TestParams;
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
+            let a = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN * LEN * LEN);
+            let b = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN * LEN * LEN);
+            let output = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN * LEN * LEN);
+            Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
+        }
+
+        fn synthesize(
+            &self,
+            mut config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            layouter
+                .assign_region(
+                    || "",
+                    |region| {
+                        let mut region = RegionCtx::new(region, 0, NUM_INNER_COLS);
+                        config
+                            .layout(
+                                &mut region,
+                                &self.inputs.clone(),
+                                Box::new(PolyOp::Einsum {
+                                    equation: "ij,jk->ik".to_string(),
+                                }),
+                            )
+                            .map_err(|_| Error::Synthesis)
+                    },
+                )
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn matmulcircuit() {
+        // get some logs fam
+        crate::logger::init_logger();
+        // parameters
+        let mut a = Tensor::from((0..LEN * LEN).map(|i| Value::known(F::from((i + 1) as u64))));
+        a.reshape(&[LEN, LEN]);
+
+        let mut w = Tensor::from((0..LEN).map(|i| Value::known(F::from((i + 1) as u64))));
+        w.reshape(&[LEN, 1]);
+
+        let circuit = MatmulCircuit::<F> {
+            inputs: [ValTensor::from(a), ValTensor::from(w)],
+            _marker: PhantomData,
+        };
+
+        let params = crate::pfsys::srs::gen_srs::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<_>,
+        >(K as u32);
+
+        let pk = crate::pfsys::create_keys::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<halo2curves::bn256::Bn256>,
+            F,
+            MatmulCircuit<F>,
+        >(&circuit, &params)
+        .unwrap();
+
+        let prover = crate::pfsys::create_proof_circuit_kzg(
+            circuit.clone(),
+            &params,
+            None,
+            &pk,
+            crate::pfsys::TranscriptType::EVM,
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(&params),
+            // use safe mode to verify that the proof is correct
+            CheckMode::SAFE,
+            None,
+        );
+
+        assert!(prover.is_ok());
+
+        let proof = prover.unwrap();
+
+        let strategy =
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(params.verifier_params());
+        let vk = pk.get_vk();
+        let result =
+            crate::pfsys::verify_proof_circuit_kzg(params.verifier_params(), proof, vk, strategy);
+
+        assert!(result.is_ok());
+
+        println!("done.");
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod matmul_col_ultra_overflow {
+    use halo2_proofs::poly::commitment::ParamsProver;
+
+    use super::*;
+
+    const K: usize = 4;
+    const LEN: usize = 20;
+
+    #[derive(Clone)]
+    struct MatmulCircuit<F: PrimeField + TensorType + PartialOrd> {
+        inputs: [ValTensor<F>; 2],
+        _marker: PhantomData<F>,
+    }
+
+    impl Circuit<F> for MatmulCircuit<F> {
+        type Config = BaseConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = TestParams;
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
+            let a = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
+        }
+
+        fn synthesize(
+            &self,
+            mut config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            layouter
+                .assign_region(
+                    || "",
+                    |region| {
+                        let mut region = RegionCtx::new(region, 0, 1);
+                        config
+                            .layout(
+                                &mut region,
+                                &self.inputs.clone(),
+                                Box::new(PolyOp::Einsum {
+                                    equation: "ij,jk->ik".to_string(),
+                                }),
+                            )
+                            .map_err(|_| Error::Synthesis)
+                    },
+                )
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn matmulcircuit() {
+        // get some logs fam
+        crate::logger::init_logger();
+        // parameters
+        let mut a = Tensor::from((0..LEN * LEN).map(|i| Value::known(F::from((i + 1) as u64))));
+        a.reshape(&[LEN, LEN]);
+
+        let mut w = Tensor::from((0..LEN).map(|i| Value::known(F::from((i + 1) as u64))));
+        w.reshape(&[LEN, 1]);
+
+        let circuit = MatmulCircuit::<F> {
+            inputs: [ValTensor::from(a), ValTensor::from(w)],
+            _marker: PhantomData,
+        };
+
+        let params = crate::pfsys::srs::gen_srs::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<_>,
+        >(K as u32);
+
+        let pk = crate::pfsys::create_keys::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<halo2curves::bn256::Bn256>,
+            F,
+            MatmulCircuit<F>,
+        >(&circuit, &params)
+        .unwrap();
+
+        let prover = crate::pfsys::create_proof_circuit_kzg(
+            circuit.clone(),
+            &params,
+            None,
+            &pk,
+            crate::pfsys::TranscriptType::EVM,
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(&params),
+            // use safe mode to verify that the proof is correct
+            CheckMode::SAFE,
+            None,
+        );
+
+        assert!(prover.is_ok());
+
+        let proof = prover.unwrap();
+
+        let strategy =
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(params.verifier_params());
+        let vk = pk.get_vk();
+        let result =
+            crate::pfsys::verify_proof_circuit_kzg(params.verifier_params(), proof, vk, strategy);
+
+        assert!(result.is_ok());
+
+        println!("done.");
     }
 }
 
@@ -193,9 +497,9 @@ mod dot {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -209,7 +513,7 @@ mod dot {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
@@ -239,7 +543,84 @@ mod dot {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
+    }
+}
+
+#[cfg(test)]
+mod dot_col_overflow_triple_col {
+    use super::*;
+
+    const K: usize = 4;
+    const LEN: usize = 50;
+
+    #[derive(Clone)]
+    struct MyCircuit<F: PrimeField + TensorType + PartialOrd> {
+        inputs: [ValTensor<F>; 2],
+        _marker: PhantomData<F>,
+    }
+
+    impl Circuit<F> for MyCircuit<F> {
+        type Config = BaseConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = TestParams;
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
+            // used for constants in the padding
+            let _fixed = cs.fixed_column();
+            cs.enable_constant(_fixed);
+
+            let a = VarTensor::new_advice(cs, K, 3, LEN);
+            let b = VarTensor::new_advice(cs, K, 3, LEN);
+            let output = VarTensor::new_advice(cs, K, 3, LEN);
+
+            Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
+        }
+
+        fn synthesize(
+            &self,
+            mut config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            layouter
+                .assign_region(
+                    || "",
+                    |region| {
+                        let mut region = RegionCtx::new(region, 0, 3);
+                        config
+                            .layout(
+                                &mut region,
+                                &self.inputs.clone(),
+                                Box::new(PolyOp::Einsum {
+                                    equation: "i,i->".to_string(),
+                                }),
+                            )
+                            .map_err(|_| Error::Synthesis)
+                    },
+                )
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dotcircuit() {
+        // parameters
+        let a = Tensor::from((0..LEN).map(|i| Value::known(F::from(i as u64 + 1))));
+
+        let b = Tensor::from((0..LEN).map(|i| Value::known(F::from(i as u64 + 1))));
+
+        let circuit = MyCircuit::<F> {
+            inputs: [ValTensor::from(a), ValTensor::from(b)],
+            _marker: PhantomData,
+        };
+
+        let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -266,9 +647,9 @@ mod dot_col_overflow {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -282,7 +663,7 @@ mod dot_col_overflow {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
@@ -312,7 +693,7 @@ mod dot_col_overflow {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -339,9 +720,9 @@ mod sum {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -355,7 +736,7 @@ mod sum {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
@@ -381,7 +762,77 @@ mod sum {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
+    }
+}
+
+#[cfg(test)]
+mod sum_col_overflow_double_col {
+    use super::*;
+
+    const K: usize = 4;
+    const LEN: usize = 20;
+    const NUM_INNER_COLS: usize = 2;
+
+    #[derive(Clone)]
+    struct MyCircuit<F: PrimeField + TensorType + PartialOrd> {
+        inputs: [ValTensor<F>; 1],
+        _marker: PhantomData<F>,
+    }
+
+    impl Circuit<F> for MyCircuit<F> {
+        type Config = BaseConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = TestParams;
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
+            let a = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN);
+            let b = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN);
+            let output = VarTensor::new_advice(cs, K, NUM_INNER_COLS, LEN);
+
+            Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
+        }
+
+        fn synthesize(
+            &self,
+            mut config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            layouter
+                .assign_region(
+                    || "",
+                    |region| {
+                        let mut region = RegionCtx::new(region, 0, NUM_INNER_COLS);
+                        config
+                            .layout(
+                                &mut region,
+                                &self.inputs.clone(),
+                                Box::new(PolyOp::Sum { axes: vec![0] }),
+                            )
+                            .map_err(|_| Error::Synthesis)
+                    },
+                )
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sumcircuit() {
+        // parameters
+        let a = Tensor::from((0..LEN).map(|i| Value::known(F::from(i as u64 + 1))));
+
+        let circuit = MyCircuit::<F> {
+            inputs: [ValTensor::from(a)],
+            _marker: PhantomData,
+        };
+
+        let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -408,9 +859,9 @@ mod sum_col_overflow {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -424,7 +875,7 @@ mod sum_col_overflow {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
@@ -450,7 +901,7 @@ mod sum_col_overflow {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -478,9 +929,9 @@ mod composition {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -495,7 +946,7 @@ mod composition {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         let _ = config
                             .layout(
                                 &mut region,
@@ -543,7 +994,7 @@ mod composition {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -571,9 +1022,9 @@ mod conv {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, (LEN + 1) * LEN);
-            let b = VarTensor::new_advice(cs, K, (LEN + 1) * LEN);
-            let output = VarTensor::new_advice(cs, K, (LEN + 1) * LEN);
+            let a = VarTensor::new_advice(cs, K, 1, (LEN + 1) * LEN);
+            let b = VarTensor::new_advice(cs, K, 1, (LEN + 1) * LEN);
+            let output = VarTensor::new_advice(cs, K, 1, (LEN + 1) * LEN);
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
 
@@ -586,7 +1037,7 @@ mod conv {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
@@ -594,7 +1045,7 @@ mod conv {
                                 Box::new(PolyOp::Conv {
                                     kernel: self.inputs[1].clone(),
                                     bias: None,
-                                    padding: (1, 1),
+                                    padding: [(1, 1); 2],
                                     stride: (2, 2),
                                 }),
                             )
@@ -619,17 +1070,17 @@ mod conv {
         let mut image =
             Tensor::from((0..in_channels * image_height * image_width).map(|_| F::random(OsRng)));
         image.reshape(&[1, in_channels, image_height, image_width]);
-        image.set_visibility(crate::graph::Visibility::Private);
+        image.set_visibility(&crate::graph::Visibility::Private);
 
         let mut kernels = Tensor::from(
             (0..{ out_channels * in_channels * kernel_height * kernel_width })
                 .map(|_| F::random(OsRng)),
         );
         kernels.reshape(&[out_channels, in_channels, kernel_height, kernel_width]);
-        kernels.set_visibility(crate::graph::Visibility::Private);
+        kernels.set_visibility(&crate::graph::Visibility::Private);
 
         let mut bias = Tensor::from((0..{ out_channels }).map(|_| F::random(OsRng)));
-        bias.set_visibility(crate::graph::Visibility::Private);
+        bias.set_visibility(&crate::graph::Visibility::Private);
 
         let circuit = ConvCircuit::<F> {
             inputs: [image, kernels, bias].to_vec(),
@@ -637,7 +1088,7 @@ mod conv {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 
     #[test]
@@ -653,14 +1104,14 @@ mod conv {
         let mut image =
             Tensor::from((0..in_channels * image_height * image_width).map(|i| F::from(i as u64)));
         image.reshape(&[1, in_channels, image_height, image_width]);
-        image.set_visibility(crate::graph::Visibility::Private);
+        image.set_visibility(&crate::graph::Visibility::Private);
 
         let mut kernels = Tensor::from(
             (0..{ out_channels * in_channels * kernel_height * kernel_width })
                 .map(|i| F::from(i as u64)),
         );
         kernels.reshape(&[out_channels, in_channels, kernel_height, kernel_width]);
-        kernels.set_visibility(crate::graph::Visibility::Private);
+        kernels.set_visibility(&crate::graph::Visibility::Private);
 
         let circuit = ConvCircuit::<F> {
             inputs: [image, kernels].to_vec(),
@@ -668,7 +1119,287 @@ mod conv {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod conv_col_ultra_overflow {
+    use halo2_proofs::poly::commitment::ParamsProver;
+
+    use super::*;
+
+    const K: usize = 4;
+    const LEN: usize = 28;
+
+    #[derive(Clone)]
+    struct ConvCircuit<F: PrimeField + TensorType + PartialOrd> {
+        image: ValTensor<F>,
+        kernel: Tensor<F>,
+        _marker: PhantomData<F>,
+    }
+
+    impl Circuit<F> for ConvCircuit<F> {
+        type Config = BaseConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = TestParams;
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
+            let a = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
+        }
+
+        fn synthesize(
+            &self,
+            mut config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            layouter
+                .assign_region(
+                    || "",
+                    |region| {
+                        let mut region = RegionCtx::new(region, 0, 1);
+                        config
+                            .layout(
+                                &mut region,
+                                &[self.image.clone()],
+                                Box::new(PolyOp::Conv {
+                                    kernel: self.kernel.clone(),
+                                    bias: None,
+                                    padding: [(1, 1); 2],
+                                    stride: (2, 2),
+                                }),
+                            )
+                            .map_err(|_| Error::Synthesis)
+                    },
+                )
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn conv_circuit() {
+        // parameters
+        let kernel_height = 2;
+        let kernel_width = 2;
+        let image_height = LEN;
+        let image_width = LEN;
+        let in_channels = 3;
+        let out_channels = 2;
+
+        // get some logs fam
+        crate::logger::init_logger();
+        let mut image =
+            Tensor::from((0..in_channels * image_height * image_width).map(|i| F::from(i as u64)));
+        image.reshape(&[1, in_channels, image_height, image_width]);
+        image.set_visibility(&crate::graph::Visibility::Private);
+
+        let mut kernels = Tensor::from(
+            (0..{ out_channels * in_channels * kernel_height * kernel_width })
+                .map(|i| F::from(i as u64)),
+        );
+        kernels.reshape(&[out_channels, in_channels, kernel_height, kernel_width]);
+        kernels.set_visibility(&crate::graph::Visibility::Private);
+
+        let circuit = ConvCircuit::<F> {
+            image: ValTensor::from(image),
+            kernel: kernels,
+            _marker: PhantomData,
+        };
+
+        let params = crate::pfsys::srs::gen_srs::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<_>,
+        >(K as u32);
+
+        let pk = crate::pfsys::create_keys::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<halo2curves::bn256::Bn256>,
+            F,
+            ConvCircuit<F>,
+        >(&circuit, &params)
+        .unwrap();
+
+        let prover = crate::pfsys::create_proof_circuit_kzg(
+            circuit.clone(),
+            &params,
+            None,
+            &pk,
+            crate::pfsys::TranscriptType::EVM,
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(&params),
+            // use safe mode to verify that the proof is correct
+            CheckMode::SAFE,
+            None,
+        );
+
+        assert!(prover.is_ok());
+
+        let proof = prover.unwrap();
+
+        let strategy =
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(params.verifier_params());
+        let vk = pk.get_vk();
+        let result =
+            crate::pfsys::verify_proof_circuit_kzg(params.verifier_params(), proof, vk, strategy);
+
+        assert!(result.is_ok());
+
+        println!("done.");
+    }
+}
+
+#[cfg(test)]
+// not wasm 32 unknown
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod conv_relu_col_ultra_overflow {
+    use halo2_proofs::poly::commitment::ParamsProver;
+
+    use super::*;
+
+    const K: usize = 4;
+    const LEN: usize = 28;
+
+    #[derive(Clone)]
+    struct ConvCircuit<F: PrimeField + TensorType + PartialOrd> {
+        image: ValTensor<F>,
+        kernel: Tensor<F>,
+        _marker: PhantomData<F>,
+    }
+
+    impl Circuit<F> for ConvCircuit<F> {
+        type Config = BaseConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = TestParams;
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
+            let a = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN * LEN * LEN);
+            let mut base_config =
+                Self::Config::configure(cs, &[a.clone(), b.clone()], &output, CheckMode::SAFE);
+            // sets up a new relu table
+            base_config
+                .configure_lookup(cs, &b, &output, &a, (-3, 3), K, &LookupOp::ReLU)
+                .unwrap();
+            base_config.clone()
+        }
+
+        fn synthesize(
+            &self,
+            mut config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            config.layout_tables(&mut layouter).unwrap();
+            layouter
+                .assign_region(
+                    || "",
+                    |region| {
+                        let mut region = RegionCtx::new(region, 0, 1);
+                        let output = config
+                            .layout(
+                                &mut region,
+                                &[self.image.clone()],
+                                Box::new(PolyOp::Conv {
+                                    kernel: self.kernel.clone(),
+                                    bias: None,
+                                    padding: [(1, 1); 2],
+                                    stride: (2, 2),
+                                }),
+                            )
+                            .map_err(|_| Error::Synthesis);
+                        let _output = config
+                            .layout(
+                                &mut region,
+                                &[output.unwrap().unwrap()],
+                                Box::new(LookupOp::ReLU),
+                            )
+                            .unwrap();
+                        Ok(())
+                    },
+                )
+                .unwrap();
+
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn conv_relu_circuit() {
+        // parameters
+        let kernel_height = 2;
+        let kernel_width = 2;
+        let image_height = LEN;
+        let image_width = LEN;
+        let in_channels = 3;
+        let out_channels = 2;
+
+        // get some logs fam
+        crate::logger::init_logger();
+        let mut image =
+            Tensor::from((0..in_channels * image_height * image_width).map(|_| F::from(0)));
+        image.reshape(&[1, in_channels, image_height, image_width]);
+        image.set_visibility(&crate::graph::Visibility::Private);
+
+        let mut kernels = Tensor::from(
+            (0..{ out_channels * in_channels * kernel_height * kernel_width }).map(|_| F::from(0)),
+        );
+        kernels.reshape(&[out_channels, in_channels, kernel_height, kernel_width]);
+        kernels.set_visibility(&crate::graph::Visibility::Private);
+
+        let circuit = ConvCircuit::<F> {
+            image: ValTensor::from(image),
+            kernel: kernels,
+            _marker: PhantomData,
+        };
+
+        let params = crate::pfsys::srs::gen_srs::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<_>,
+        >(K as u32);
+
+        let pk = crate::pfsys::create_keys::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<halo2curves::bn256::Bn256>,
+            F,
+            ConvCircuit<F>,
+        >(&circuit, &params)
+        .unwrap();
+
+        let prover = crate::pfsys::create_proof_circuit_kzg(
+            circuit.clone(),
+            &params,
+            None,
+            &pk,
+            crate::pfsys::TranscriptType::EVM,
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(&params),
+            // use safe mode to verify that the proof is correct
+            CheckMode::SAFE,
+            None,
+        );
+
+        assert!(prover.is_ok());
+
+        let proof = prover.unwrap();
+
+        let strategy =
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(params.verifier_params());
+        let vk = pk.get_vk();
+        let result =
+            crate::pfsys::verify_proof_circuit_kzg(params.verifier_params(), proof, vk, strategy);
+
+        assert!(result.is_ok());
+
+        println!("done.");
     }
 }
 
@@ -696,9 +1427,10 @@ mod sumpool {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, (LEN + 1) * LEN);
-            let b = VarTensor::new_advice(cs, K, (LEN + 1) * LEN);
-            let output = VarTensor::new_advice(cs, K, (LEN + 1) * LEN);
+            let a = VarTensor::new_advice(cs, K, 1, (LEN + 1) * LEN);
+            let b = VarTensor::new_advice(cs, K, 1, (LEN + 1) * LEN);
+            let output = VarTensor::new_advice(cs, K, 1, (LEN + 1) * LEN);
+            VarTensor::constant_cols(cs, K, 2, false);
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
 
@@ -711,13 +1443,13 @@ mod sumpool {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
                                 &self.inputs.clone(),
                                 Box::new(PolyOp::SumPool {
-                                    padding: (0, 0),
+                                    padding: [(0, 0); 2],
                                     stride: (1, 1),
                                     kernel_shape: (3, 3),
                                 }),
@@ -747,7 +1479,7 @@ mod sumpool {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -774,9 +1506,9 @@ mod add_w_shape_casting {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -790,13 +1522,9 @@ mod add_w_shape_casting {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
-                            .layout(
-                                &mut region,
-                                &self.inputs.clone(),
-                                Box::new(PolyOp::Add { a: None }),
-                            )
+                            .layout(&mut region, &self.inputs.clone(), Box::new(PolyOp::Add))
                             .map_err(|_| Error::Synthesis)
                     },
                 )
@@ -818,7 +1546,7 @@ mod add_w_shape_casting {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -845,9 +1573,9 @@ mod add {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -861,13 +1589,9 @@ mod add {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
-                            .layout(
-                                &mut region,
-                                &self.inputs.clone(),
-                                Box::new(PolyOp::Add { a: None }),
-                            )
+                            .layout(&mut region, &self.inputs.clone(), Box::new(PolyOp::Add))
                             .map_err(|_| Error::Synthesis)
                     },
                 )
@@ -889,7 +1613,7 @@ mod add {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -916,9 +1640,9 @@ mod add_with_overflow {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -932,13 +1656,9 @@ mod add_with_overflow {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
-                            .layout(
-                                &mut region,
-                                &self.inputs.clone(),
-                                Box::new(PolyOp::Add { a: None }),
-                            )
+                            .layout(&mut region, &self.inputs.clone(), Box::new(PolyOp::Add))
                             .map_err(|_| Error::Synthesis)
                     },
                 )
@@ -960,7 +1680,7 @@ mod add_with_overflow {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -1004,13 +1724,14 @@ mod add_with_overflow_and_poseidon {
         }
 
         fn configure(cs: &mut ConstraintSystem<Fr>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             let base = BaseConfig::configure(cs, &[a, b], &output, CheckMode::SAFE);
+            VarTensor::constant_cols(cs, K, 2, false);
 
-            let poseidon = PoseidonChip::<PoseidonSpec, WIDTH, RATE, WIDTH>::configure(cs);
+            let poseidon = PoseidonChip::<PoseidonSpec, WIDTH, RATE, WIDTH>::configure(cs, ());
 
             MyCircuitConfig { base, poseidon }
         }
@@ -1023,10 +1744,8 @@ mod add_with_overflow_and_poseidon {
             let poseidon_chip: PoseidonChip<PoseidonSpec, WIDTH, RATE, WIDTH> =
                 PoseidonChip::new(config.poseidon.clone());
 
-            let assigned_inputs_a =
-                poseidon_chip.layout(&mut layouter, &self.inputs[0..1], vec![0])?;
-            let assigned_inputs_b =
-                poseidon_chip.layout(&mut layouter, &self.inputs[1..2], vec![1])?;
+            let assigned_inputs_a = poseidon_chip.layout(&mut layouter, &self.inputs[0..1], 0)?;
+            let assigned_inputs_b = poseidon_chip.layout(&mut layouter, &self.inputs[1..2], 1)?;
 
             layouter.assign_region(|| "_new_module", |_| Ok(()))?;
 
@@ -1035,10 +1754,10 @@ mod add_with_overflow_and_poseidon {
             layouter.assign_region(
                 || "model",
                 |region| {
-                    let mut region = RegionCtx::new(region, 0);
+                    let mut region = RegionCtx::new(region, 0, 1);
                     config
                         .base
-                        .layout(&mut region, &inputs, Box::new(PolyOp::Add { a: None }))
+                        .layout(&mut region, &inputs, Box::new(PolyOp::Add))
                         .map_err(|_| Error::Synthesis)
                 },
             )?;
@@ -1070,7 +1789,7 @@ mod add_with_overflow_and_poseidon {
 
         let prover =
             MockProver::run(K as u32, &circuit, vec![vec![commitment_a, commitment_b]]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 
     #[test]
@@ -1125,9 +1844,9 @@ mod sub {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -1141,7 +1860,7 @@ mod sub {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(&mut region, &self.inputs.clone(), Box::new(PolyOp::Sub))
                             .map_err(|_| Error::Synthesis)
@@ -1165,7 +1884,7 @@ mod sub {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -1192,9 +1911,9 @@ mod mult {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -1208,13 +1927,9 @@ mod mult {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
-                            .layout(
-                                &mut region,
-                                &self.inputs.clone(),
-                                Box::new(PolyOp::Mult { a: None }),
-                            )
+                            .layout(&mut region, &self.inputs.clone(), Box::new(PolyOp::Mult))
                             .map_err(|_| Error::Synthesis)
                     },
                 )
@@ -1236,7 +1951,7 @@ mod mult {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -1263,9 +1978,9 @@ mod pow {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -1279,7 +1994,7 @@ mod pow {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(&mut region, &self.inputs.clone(), Box::new(PolyOp::Pow(5)))
                             .map_err(|_| Error::Synthesis)
@@ -1301,7 +2016,7 @@ mod pow {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -1328,9 +2043,9 @@ mod pack {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE)
         }
@@ -1344,7 +2059,7 @@ mod pack {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
@@ -1370,96 +2085,7 @@ mod pack {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
-    }
-}
-
-#[cfg(test)]
-mod rescaled {
-    use super::*;
-
-    const K: usize = 8;
-    const LEN: usize = 4;
-
-    #[derive(Clone)]
-    struct MyCircuit<F: PrimeField + TensorType + PartialOrd> {
-        inputs: [ValTensor<F>; 1],
-        _marker: PhantomData<F>,
-    }
-
-    impl Circuit<F> for MyCircuit<F> {
-        type Config = BaseConfig<F>;
-        type FloorPlanner = SimpleFloorPlanner;
-        type Params = TestParams;
-
-        fn without_witnesses(&self) -> Self {
-            self.clone()
-        }
-
-        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
-
-            let mut config = Self::Config::configure(cs, &[a, b.clone()], &output, CheckMode::SAFE);
-
-            config
-                .configure_lookup(
-                    cs,
-                    &b,
-                    &output,
-                    7,
-                    &LookupOp::Div {
-                        denom: (5.0).into(),
-                    },
-                )
-                .unwrap();
-
-            config
-        }
-
-        fn synthesize(
-            &self,
-            mut config: Self::Config,
-            mut layouter: impl Layouter<F>,
-        ) -> Result<(), Error> {
-            config.layout_tables(&mut layouter).unwrap();
-
-            layouter
-                .assign_region(
-                    || "",
-                    |region| {
-                        let mut region = RegionCtx::new(region, 0);
-                        config
-                            .layout(
-                                &mut region,
-                                &self.inputs.clone(),
-                                Box::new(Rescaled {
-                                    inner: Box::new(PolyOp::Sum { axes: vec![0] }),
-                                    scale: vec![(0, 5)],
-                                }),
-                            )
-                            .map_err(|_| Error::Synthesis)
-                    },
-                )
-                .unwrap();
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn rescaledcircuit() {
-        // parameters
-        let mut a = Tensor::from((0..LEN).map(|i| Value::known(F::from(i as u64))));
-        a.reshape(&[LEN, 1]);
-
-        let circuit = MyCircuit::<F> {
-            inputs: [ValTensor::from(a)],
-            _marker: PhantomData,
-        };
-
-        let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -1493,15 +2119,15 @@ mod matmul_relu {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
 
             let mut base_config =
-                BaseConfig::configure(cs, &[a, b.clone()], &output, CheckMode::SAFE);
+                BaseConfig::configure(cs, &[a.clone(), b.clone()], &output, CheckMode::SAFE);
             // sets up a new relu table
             base_config
-                .configure_lookup(cs, &b, &output, 16, &LookupOp::ReLU { scale: 1 })
+                .configure_lookup(cs, &b, &output, &a, (-32768, 32768), K, &LookupOp::ReLU)
                 .unwrap();
 
             MyConfig { base_config }
@@ -1516,7 +2142,7 @@ mod matmul_relu {
             layouter.assign_region(
                 || "",
                 |region| {
-                    let mut region = RegionCtx::new(region, 0);
+                    let mut region = RegionCtx::new(region, 0, 1);
                     let op = PolyOp::Einsum {
                         equation: "ij,jk->ik".to_string(),
                     };
@@ -1526,11 +2152,7 @@ mod matmul_relu {
                         .unwrap();
                     let _output = config
                         .base_config
-                        .layout(
-                            &mut region,
-                            &[output.unwrap()],
-                            Box::new(LookupOp::ReLU { scale: 1 }),
-                        )
+                        .layout(&mut region, &[output.unwrap()], Box::new(LookupOp::ReLU))
                         .unwrap();
                     Ok(())
                 },
@@ -1556,7 +2178,7 @@ mod matmul_relu {
         };
 
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }
 
@@ -1594,18 +2216,29 @@ mod rangecheckpercent {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let scale = SCALE.pow(2);
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
-            let mut config = Self::Config::configure(cs, &[a, b.clone()], &output, CheckMode::SAFE);
+            let scale = utils::F32(SCALE.pow(2) as f32);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
+            let mut config =
+                Self::Config::configure(cs, &[a.clone(), b.clone()], &output, CheckMode::SAFE);
             // set up a new GreaterThan and Recip tables
             let nl = &LookupOp::GreaterThan {
-                a: circuit::utils::F32((RANGE * scale as f32) / 100.0),
+                a: circuit::utils::F32((RANGE * scale.0) / 100.0),
             };
-            config.configure_lookup(cs, &b, &output, 16, nl).unwrap();
             config
-                .configure_lookup(cs, &b, &output, 16, &LookupOp::Recip { scale })
+                .configure_lookup(cs, &b, &output, &a, (-32768, 32768), K, nl)
+                .unwrap();
+            config
+                .configure_lookup(
+                    cs,
+                    &b,
+                    &output,
+                    &a,
+                    (-32768, 32768),
+                    K,
+                    &LookupOp::Recip { scale },
+                )
                 .unwrap();
             config
         }
@@ -1620,14 +2253,14 @@ mod rangecheckpercent {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
                             .layout(
                                 &mut region,
                                 &[self.output.clone(), self.input.clone()],
                                 Box::new(HybridOp::RangeCheck(Tolerance {
                                     val: RANGE,
-                                    scales: (SCALE, SCALE),
+                                    scale: SCALE.into(),
                                 })),
                             )
                             .map_err(|_| Error::Synthesis)
@@ -1651,7 +2284,7 @@ mod rangecheckpercent {
                 _marker: PhantomData,
             };
             let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-            prover.assert_satisfied();
+            prover.assert_satisfied_par();
         }
         {
             let inp = Tensor::new(Some(&[Value::<F>::known(F::from(200_u64))]), &[1]).unwrap();
@@ -1662,7 +2295,7 @@ mod rangecheckpercent {
                 _marker: PhantomData,
             };
             let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-            prover.assert_satisfied();
+            prover.assert_satisfied_par();
         }
 
         // Unsuccessful case
@@ -1711,16 +2344,16 @@ mod relu {
         }
 
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let advices = (0..2)
-                .map(|_| VarTensor::new_advice(cs, 4, 3))
+            let advices = (0..3)
+                .map(|_| VarTensor::new_advice(cs, 4, 1, 3))
                 .collect::<Vec<_>>();
 
-            let nl = LookupOp::ReLU { scale: 1 };
+            let nl = LookupOp::ReLU;
 
             let mut config = BaseConfig::default();
 
             config
-                .configure_lookup(cs, &advices[0], &advices[1], 2, &nl)
+                .configure_lookup(cs, &advices[0], &advices[1], &advices[2], (-6, 6), 4, &nl)
                 .unwrap();
             config
         }
@@ -1735,13 +2368,9 @@ mod relu {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         config
-                            .layout(
-                                &mut region,
-                                &[self.input.clone()],
-                                Box::new(LookupOp::ReLU { scale: 1 }),
-                            )
+                            .layout(&mut region, &[self.input.clone()], Box::new(LookupOp::ReLU))
                             .map_err(|_| Error::Synthesis)
                     },
                 )
@@ -1761,7 +2390,127 @@ mod relu {
         };
 
         let prover = MockProver::run(4_u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod lookup_ultra_overflow {
+    use super::*;
+    use halo2_proofs::{
+        circuit::{Layouter, SimpleFloorPlanner, Value},
+        plonk::{Circuit, ConstraintSystem, Error},
+        poly::commitment::ParamsProver,
+    };
+
+    #[derive(Clone)]
+    struct ReLUCircuit<F: PrimeField + TensorType + PartialOrd> {
+        pub input: ValTensor<F>,
+    }
+
+    impl Circuit<F> for ReLUCircuit<F> {
+        type Config = BaseConfig<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+        type Params = TestParams;
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
+            let advices = (0..3)
+                .map(|_| VarTensor::new_advice(cs, 4, 1, 3))
+                .collect::<Vec<_>>();
+
+            let nl = LookupOp::ReLU;
+
+            let mut config = BaseConfig::default();
+
+            config
+                .configure_lookup(
+                    cs,
+                    &advices[0],
+                    &advices[1],
+                    &advices[2],
+                    (-1024, 1024),
+                    4,
+                    &nl,
+                )
+                .unwrap();
+            config
+        }
+
+        fn synthesize(
+            &self,
+            mut config: Self::Config,
+            mut layouter: impl Layouter<F>, // layouter is our 'write buffer' for the circuit
+        ) -> Result<(), Error> {
+            config.layout_tables(&mut layouter).unwrap();
+            layouter
+                .assign_region(
+                    || "",
+                    |region| {
+                        let mut region = RegionCtx::new(region, 0, 1);
+                        config
+                            .layout(&mut region, &[self.input.clone()], Box::new(LookupOp::ReLU))
+                            .map_err(|_| Error::Synthesis)
+                    },
+                )
+                .unwrap();
+
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn relucircuit() {
+        // get some logs fam
+        crate::logger::init_logger();
+        // parameters
+        let a = Tensor::from((0..4).map(|i| Value::known(F::from(i + 1))));
+
+        let circuit = ReLUCircuit::<F> {
+            input: ValTensor::from(a),
+        };
+
+        let params = crate::pfsys::srs::gen_srs::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<_>,
+        >(4_u32);
+
+        let pk = crate::pfsys::create_keys::<
+            halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme<halo2curves::bn256::Bn256>,
+            F,
+            ReLUCircuit<F>,
+        >(&circuit, &params)
+        .unwrap();
+
+        let prover = crate::pfsys::create_proof_circuit_kzg(
+            circuit.clone(),
+            &params,
+            None,
+            &pk,
+            crate::pfsys::TranscriptType::EVM,
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(&params),
+            // use safe mode to verify that the proof is correct
+            CheckMode::SAFE,
+            None,
+        );
+
+        assert!(prover.is_ok());
+
+        let proof = prover.unwrap();
+
+        let strategy =
+            halo2_proofs::poly::kzg::strategy::SingleStrategy::new(params.verifier_params());
+        let vk = pk.get_vk();
+        let result =
+            crate::pfsys::verify_proof_circuit_kzg(params.verifier_params(), proof, vk, strategy);
+
+        assert!(result.is_ok());
+
+        println!("done.");
     }
 }
 
@@ -1777,7 +2526,7 @@ mod softmax {
 
     const K: usize = 18;
     const LEN: usize = 3;
-    const SCALE: usize = i128::pow(2, 7) as usize;
+    const SCALE: f32 = 128.0;
 
     #[derive(Clone)]
     struct SoftmaxCircuit<F: PrimeField + TensorType + PartialOrd> {
@@ -1794,12 +2543,12 @@ mod softmax {
             self.clone()
         }
         fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-            let a = VarTensor::new_advice(cs, K, LEN);
-            let b = VarTensor::new_advice(cs, K, LEN);
-            let output = VarTensor::new_advice(cs, K, LEN);
+            let a = VarTensor::new_advice(cs, K, 1, LEN);
+            let b = VarTensor::new_advice(cs, K, 1, LEN);
+            let output = VarTensor::new_advice(cs, K, 1, LEN);
             let mut config = Self::Config::configure(cs, &[a, b], &output, CheckMode::SAFE);
-            let advices = (0..2)
-                .map(|_| VarTensor::new_advice(cs, K, LEN))
+            let advices = (0..3)
+                .map(|_| VarTensor::new_advice(cs, K, 1, LEN))
                 .collect::<Vec<_>>();
 
             config
@@ -1807,9 +2556,11 @@ mod softmax {
                     cs,
                     &advices[0],
                     &advices[1],
-                    16,
+                    &advices[2],
+                    (-32768, 32768),
+                    K,
                     &LookupOp::Exp {
-                        scales: (SCALE, SCALE),
+                        scale: SCALE.into(),
                     },
                 )
                 .unwrap();
@@ -1818,9 +2569,11 @@ mod softmax {
                     cs,
                     &advices[0],
                     &advices[1],
-                    16,
+                    &advices[2],
+                    (-32768, 32768),
+                    K,
                     &LookupOp::Recip {
-                        scale: SCALE.pow(2),
+                        scale: SCALE.powf(2.0).into(),
                     },
                 )
                 .unwrap();
@@ -1837,13 +2590,14 @@ mod softmax {
                 .assign_region(
                     || "",
                     |region| {
-                        let mut region = RegionCtx::new(region, 0);
+                        let mut region = RegionCtx::new(region, 0, 1);
                         let _output = config
                             .layout(
                                 &mut region,
                                 &[self.input.clone()],
                                 Box::new(HybridOp::Softmax {
-                                    scales: (SCALE, SCALE),
+                                    scale: SCALE.into(),
+                                    axes: vec![0],
                                 }),
                             )
                             .unwrap();
@@ -1865,6 +2619,6 @@ mod softmax {
             _marker: PhantomData,
         };
         let prover = MockProver::run(K as u32, &circuit, vec![]).unwrap();
-        prover.assert_satisfied();
+        prover.assert_satisfied_par();
     }
 }

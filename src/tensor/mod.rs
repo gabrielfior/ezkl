@@ -6,7 +6,13 @@ pub mod val;
 pub mod var;
 
 use halo2curves::ff::PrimeField;
-use rayon::prelude::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::{
+    prelude::{
+        IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
+        ParallelIterator,
+    },
+    slice::ParallelSliceMut,
+};
 use serde::{Deserialize, Serialize};
 pub use val::*;
 pub use var::*;
@@ -43,8 +49,11 @@ pub enum TensorError {
     #[error("wrong method called")]
     WrongMethod,
     /// Significant bit truncation when instantiating
-    #[error("Significant bit truncation when instantiating")]
+    #[error("Significant bit truncation when instantiating, try lowering the scale")]
     SigBitTruncationError,
+    /// Failed to convert to field element tensor
+    #[error("Failed to convert to field element tensor")]
+    FeltError,
 }
 
 /// The (inner) type of tensor elements.
@@ -126,6 +135,7 @@ impl TensorType for f64 {
     }
 }
 
+tensor_type!(bool, Bool, false, true);
 tensor_type!(i128, Int128, 0, 1);
 tensor_type!(i32, Int32, 0, 1);
 tensor_type!(usize, USize, 0, 1);
@@ -264,7 +274,7 @@ impl TensorType for halo2curves::bn256::Fr {
 pub struct Tensor<T: TensorType> {
     inner: Vec<T>,
     dims: Vec<usize>,
-    scale: Option<u32>,
+    scale: Option<crate::Scale>,
     visibility: Option<Visibility>,
 }
 
@@ -438,7 +448,13 @@ impl<'data, T: Clone + TensorType + std::marker::Send + std::marker::Sync>
 impl<T: Clone + TensorType> Tensor<T> {
     /// Sets (copies) the tensor values to the provided ones.
     pub fn new(values: Option<&[T]>, dims: &[usize]) -> Result<Self, TensorError> {
-        let total_dims: usize = dims.iter().product();
+        let total_dims: usize = if !dims.is_empty() {
+            dims.iter().product()
+        } else if values.is_some() {
+            1
+        } else {
+            0
+        };
         match values {
             Some(v) => {
                 if total_dims != v.len() {
@@ -461,23 +477,23 @@ impl<T: Clone + TensorType> Tensor<T> {
     }
 
     /// set the tensor's (optional) scale parameter
-    pub fn set_scale(&mut self, scale: u32) {
+    pub fn set_scale(&mut self, scale: crate::Scale) {
         self.scale = Some(scale)
     }
 
     /// set the tensor's (optional) visibility parameter
-    pub fn set_visibility(&mut self, visibility: Visibility) {
-        self.visibility = Some(visibility)
+    pub fn set_visibility(&mut self, visibility: &Visibility) {
+        self.visibility = Some(visibility.clone())
     }
 
     /// getter for scale
-    pub fn scale(&self) -> Option<u32> {
+    pub fn scale(&self) -> Option<crate::Scale> {
         self.scale
     }
 
     /// getter for visibility
     pub fn visibility(&self) -> Option<Visibility> {
-        self.visibility
+        self.visibility.clone()
     }
 
     /// Returns the number of elements in the tensor.
@@ -486,7 +502,12 @@ impl<T: Clone + TensorType> Tensor<T> {
     }
     /// Checks if the number of elements in tensor is 0.
     pub fn is_empty(&self) -> bool {
-        self.dims().iter().product::<usize>() == 0
+        self.inner.len() == 0
+    }
+
+    /// Checks if the number of elements in tensor is 1 but with an empty dimension (this is for onnx compatibility).
+    pub fn is_singleton(&self) -> bool {
+        self.dims().is_empty() && self.len() == 1
     }
 
     /// Set one single value on the tensor.
@@ -520,8 +541,75 @@ impl<T: Clone + TensorType> Tensor<T> {
         self[index].clone()
     }
 
-    /// Get a slice from the Tensor.
+    /// Get a mutable array index from rows / columns indices.
     ///
+    /// ```
+    /// use ezkl::tensor::Tensor;
+    /// let mut a = Tensor::<i32>::new(None, &[2, 3, 5]).unwrap();
+    ///
+    /// a[1*15 + 1*5 + 1] = 5;
+    /// assert_eq!(a.get(&[1, 1, 1]), 5);
+    /// ```
+    pub fn get_mut(&mut self, indices: &[usize]) -> &mut T {
+        assert_eq!(self.dims.len(), indices.len());
+        let mut index = 0;
+        let mut d = 1;
+        for i in (0..indices.len()).rev() {
+            assert!(self.dims[i] > indices[i]);
+            index += indices[i] * d;
+            d *= self.dims[i];
+        }
+        &mut self[index]
+    }
+
+    /// Pad to a length that is divisible by n
+    /// ```
+    /// use ezkl::tensor::Tensor;
+    /// let mut a = Tensor::<i32>::new(Some(&[1,2,3,4,5,6]), &[2, 3]).unwrap();
+    /// let expected = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6, 0, 0]), &[8]).unwrap();
+    /// assert_eq!(a.pad_to_zero_rem(4).unwrap(), expected);
+    ///
+    /// let expected = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6, 0, 0, 0]), &[9]).unwrap();
+    /// assert_eq!(a.pad_to_zero_rem(9).unwrap(), expected);
+    /// ```
+    pub fn pad_to_zero_rem(&self, n: usize) -> Result<Tensor<T>, TensorError> {
+        let mut inner = self.inner.clone();
+        let remainder = self.len() % n;
+        if remainder != 0 {
+            inner.resize(self.len() + n - remainder, T::zero().unwrap());
+        }
+        Tensor::new(Some(&inner), &[inner.len()])
+    }
+
+    /// Get a single value from the Tensor.
+    ///
+    /// ```
+    /// use ezkl::tensor::Tensor;
+    /// let mut a = Tensor::<i32>::new(None, &[2, 3, 5]).unwrap();
+    ///
+    /// let flat_index = 1*15 + 1*5 + 1;
+    /// a[1*15 + 1*5 + 1] = 5;
+    /// assert_eq!(a.get_flat_index(flat_index), 5);
+    /// ```
+    pub fn get_flat_index(&self, index: usize) -> T {
+        self[index].clone()
+    }
+
+    /// Display a tensor
+    pub fn show(&self) -> String {
+        if self.len() > 12 {
+            let start = self[..12].to_vec();
+            // print the two split by ... in the middle
+            format!(
+                "[{} ...]",
+                start.iter().map(|x| format!("{:?}", x)).join(", "),
+            )
+        } else {
+            format!("[{:?}]", self.iter().map(|x| format!("{:?}", x)).join(", "))
+        }
+    }
+
+    /// Get a slice from the Tensor.
     /// ```
     /// use ezkl::tensor::Tensor;
     /// let mut a = Tensor::<i32>::new(Some(&[1, 2, 3]), &[3]).unwrap();
@@ -529,27 +617,42 @@ impl<T: Clone + TensorType> Tensor<T> {
     ///
     /// assert_eq!(a.get_slice(&[0..2]).unwrap(), b);
     /// ```
-    pub fn get_slice(&self, indices: &[Range<usize>]) -> Result<Tensor<T>, TensorError> {
+    pub fn get_slice(&self, indices: &[Range<usize>]) -> Result<Tensor<T>, TensorError>
+    where
+        T: Send + Sync,
+    {
+        if indices.is_empty() {
+            return Ok(self.clone());
+        }
         if self.dims.len() < indices.len() {
             return Err(TensorError::DimError);
+        } else if indices.iter().map(|x| x.end - x.start).collect::<Vec<_>>() == self.dims {
+            // else if slice is the same as dims, return self
+            return Ok(self.clone());
         }
-        let mut res = Vec::new();
+
         // if indices weren't specified we fill them in as required
         let mut full_indices = indices.to_vec();
 
         for i in 0..(self.dims.len() - indices.len()) {
             full_indices.push(0..self.dims()[indices.len() + i])
         }
-        for e in full_indices.iter().cloned().multi_cartesian_product() {
-            let index = self.get_index(&e);
-            res.push(self[index].clone())
-        }
+
+        let cartesian_coord: Vec<Vec<usize>> = full_indices
+            .iter()
+            .cloned()
+            .multi_cartesian_product()
+            .collect();
+
+        let res: Vec<T> = cartesian_coord
+            .par_iter()
+            .map(|e| {
+                let index = self.get_index(e);
+                self[index].clone()
+            })
+            .collect();
+
         let dims: Vec<usize> = full_indices.iter().map(|e| e.end - e.start).collect();
-        // for i in (0..indices.len()).rev() {
-        //     if (dims[i] == 1) && (dims.len() > 1) {
-        //         dims.remove(i);
-        //     }
-        // }
 
         Tensor::new(Some(&res), &dims)
     }
@@ -583,24 +686,25 @@ impl<T: Clone + TensorType> Tensor<T> {
     /// use ezkl::tensor::Tensor;
     /// let a = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6]), &[6]).unwrap();
     /// let expected = Tensor::<i32>::new(Some(&[1, 2, 3, 3, 4, 5, 5, 6]), &[8]).unwrap();
-    /// assert_eq!(a.duplicate_every_n(3, 0).unwrap(), expected);
-    /// assert_eq!(a.duplicate_every_n(7, 0).unwrap(), a);
+    /// assert_eq!(a.duplicate_every_n(3, 1, 0).unwrap(), expected);
+    /// assert_eq!(a.duplicate_every_n(7, 1, 0).unwrap(), a);
     ///
     /// let expected = Tensor::<i32>::new(Some(&[1, 1, 2, 3, 3, 4, 5, 5, 6]), &[9]).unwrap();
-    /// assert_eq!(a.duplicate_every_n(3, 2).unwrap(), expected);
+    /// assert_eq!(a.duplicate_every_n(3, 1, 2).unwrap(), expected);
     ///
     /// ```
     pub fn duplicate_every_n(
         &self,
         n: usize,
+        num_repeats: usize,
         initial_offset: usize,
     ) -> Result<Tensor<T>, TensorError> {
         let mut inner: Vec<T> = vec![];
         let mut offset = initial_offset;
         for (i, elem) in self.inner.clone().into_iter().enumerate() {
             if (i + offset + 1) % n == 0 {
-                inner.extend(vec![elem; 2].into_iter());
-                offset += 1;
+                inner.extend(vec![elem; 1 + num_repeats]);
+                offset += num_repeats;
             } else {
                 inner.push(elem.clone());
             }
@@ -613,28 +717,66 @@ impl<T: Clone + TensorType> Tensor<T> {
     /// ```
     /// use ezkl::tensor::Tensor;
     /// let a = Tensor::<i32>::new(Some(&[1, 2, 3, 3, 4, 5, 6, 6]), &[8]).unwrap();
-    /// let expected = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6]), &[6]).unwrap();
-    /// assert_eq!(a.remove_every_n(4, 0).unwrap(), expected);
+    /// let expected = Tensor::<i32>::new(Some(&[1, 2, 3, 3, 5, 6, 6]), &[7]).unwrap();
+    /// assert_eq!(a.remove_every_n(4, 1, 0).unwrap(), expected);
     ///
-    /// let a = Tensor::<i32>::new(Some(&[1, 2, 3, 3, 4, 5, 6]), &[7]).unwrap();
-    /// assert_eq!(a.remove_every_n(4, 0).unwrap(), expected);
-    /// assert_eq!(a.remove_every_n(9, 0).unwrap(), a);
-    ///
-    /// let a = Tensor::<i32>::new(Some(&[1, 1, 2, 3, 3, 4, 5, 5, 6]), &[9]).unwrap();
-    /// assert_eq!(a.remove_every_n(3, 2).unwrap(), expected);
     ///
     pub fn remove_every_n(
         &self,
         n: usize,
+        num_repeats: usize,
         initial_offset: usize,
     ) -> Result<Tensor<T>, TensorError> {
         let mut inner: Vec<T> = vec![];
-        for (i, elem) in self.inner.clone().into_iter().enumerate() {
+        let mut indices_to_remove = std::collections::HashSet::new();
+        for i in 0..self.inner.len() {
             if (i + initial_offset + 1) % n == 0 {
-            } else {
+                for j in 1..(1 + num_repeats) {
+                    indices_to_remove.insert(i + j);
+                }
+            }
+        }
+
+        let old_inner = self.inner.clone();
+        for (i, elem) in old_inner.into_iter().enumerate() {
+            if !indices_to_remove.contains(&i) {
                 inner.push(elem.clone());
             }
         }
+
+        Tensor::new(Some(&inner), &[inner.len()])
+    }
+
+    /// Remove indices
+    /// WARN: assumes indices are in ascending order for speed
+    /// ```
+    /// use ezkl::tensor::Tensor;
+    /// let a = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6]), &[6]).unwrap();
+    /// let expected = Tensor::<i32>::new(Some(&[1, 2, 3, 6]), &[4]).unwrap();
+    /// let mut indices = vec![3, 4];
+    /// assert_eq!(a.remove_indices(&mut indices, true).unwrap(), expected);
+    ///
+    ///
+    /// let a = Tensor::<i32>::new(Some(&[52, -245, 153, 13, -4, -56, -163, 249, -128, -172, 396, 143, 2, -96, 504, -44, -158, -393, 61, 95, 191, 74, 64, -219, 553, 104, 235, 222, 44, -216, 63, -251, 40, -140, 112, -355, 60, 123, 26, -116, -89, -200, -109, 168, 135, -34, -99, -54, 5, -81, 322, 87, 4, -139, 420, 92, -295, -12, 262, -1, 26, -48, 231, 1, -335, 244, 188, -4, 5, -362, 57, -198, -184, -117, 40, 305, 49, 30, -59, -26, -37, 96]), &[82]).unwrap();
+    /// let b = Tensor::<i32>::new(Some(&[52, -245, 153, 13, -4, -56, -163, 249, -128, -172, 396, 143, 2, -96, 504, -44, -158, -393, 61, 95, 191, 74, 64, -219, 553, 104, 235, 222, 44, -216, 63, -251, 40, -140, 112, -355, 60, 123, 26, -116, -89, -200, -109, 168, 135, -34, -99, -54, 5, -81, 322, 87, 4, -139, 420, 92, -295, -12, 262, -1, 26, -48, 231, -335, 244, 188, 5, -362, 57, -198, -184, -117, 40, 305, 49, 30, -59, -26, -37, 96]), &[80]).unwrap();
+    /// let mut indices = vec![63, 67];
+    /// assert_eq!(a.remove_indices(&mut indices, true).unwrap(), b);
+    /// ```
+    pub fn remove_indices(
+        &self,
+        indices: &mut [usize],
+        is_sorted: bool,
+    ) -> Result<Tensor<T>, TensorError> {
+        let mut inner: Vec<T> = self.inner.clone();
+        // time it
+        if !is_sorted {
+            indices.par_sort_unstable();
+        }
+        // remove indices
+        for elem in indices.iter().rev() {
+            inner.remove(*elem);
+        }
+
         Tensor::new(Some(&inner), &[inner.len()])
     }
 
@@ -651,8 +793,25 @@ impl<T: Clone + TensorType> Tensor<T> {
     /// assert_eq!(a.dims(), &[9, 3]);
     /// ```
     pub fn reshape(&mut self, new_dims: &[usize]) {
-        assert!(self.len() == new_dims.iter().product::<usize>());
-        self.dims = Vec::from(new_dims);
+        // in onnx parlance this corresponds to converting a tensor to a single element
+        if new_dims.is_empty() {
+            assert!(self.len() == 1 || self.is_empty());
+            self.dims = vec![];
+        } else {
+            let product = if new_dims != [0] {
+                new_dims.iter().product::<usize>()
+            } else {
+                0
+            };
+            if self.len() != product {
+                panic!(
+                    "Cannot reshape tensor of size {} to {:?}",
+                    self.len(),
+                    new_dims
+                );
+            }
+            self.dims = Vec::from(new_dims);
+        }
     }
 
     /// Move axis of the tensor
@@ -670,6 +829,11 @@ impl<T: Clone + TensorType> Tensor<T> {
     /// let mut a = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]), &[2, 3, 2]).unwrap();
     /// let mut expected = Tensor::<i32>::new(Some(&[1, 3, 5, 2, 4, 6, 7, 9, 11, 8, 10, 12]), &[2, 2, 3]).unwrap();
     /// let b = a.move_axis(1, 2).unwrap();
+    /// assert_eq!(b, expected);
+    ///
+    /// let mut a = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]), &[2, 3, 2]).unwrap();
+    /// let mut expected = Tensor::<i32>::new(Some(&[1, 3, 5, 2, 4, 6, 7, 9, 11, 8, 10, 12]), &[2, 2, 3]).unwrap();
+    /// let b = a.move_axis(2, 1).unwrap();
     /// assert_eq!(b, expected);
     /// ```
     pub fn move_axis(&mut self, source: usize, destination: usize) -> Result<Self, TensorError> {
@@ -695,14 +859,87 @@ impl<T: Clone + TensorType> Tensor<T> {
 
         for coord in cartesian_coords {
             let mut old_coord = vec![0; self.dims.len()];
+
             // now fetch the old index
             for (i, c) in coord.iter().enumerate() {
                 if i == destination {
                     old_coord[source] = *c;
-                } else if i < source {
+                } else if i == source && source < destination {
+                    old_coord[source + 1] = *c;
+                } else if i == source && source > destination {
+                    old_coord[source - 1] = *c;
+                } else if (i < source && source < destination)
+                    || (i < destination && source > destination)
+                {
                     old_coord[i] = *c;
-                } else if i >= source {
+                } else if i > source && source < destination {
                     old_coord[i + 1] = *c;
+                } else if i > destination && source > destination {
+                    old_coord[i - 1] = *c;
+                } else {
+                    panic!()
+                }
+            }
+            output.set(&coord, self.get(&old_coord));
+        }
+
+        Ok(output)
+    }
+
+    /// Swap axes of the tensor
+    /// ```
+    /// use ezkl::tensor::Tensor;
+    /// let mut a = Tensor::<f32>::new(None, &[3, 3, 3]).unwrap();
+    /// let b = a.swap_axes(0, 2).unwrap();
+    /// assert_eq!(b.dims(), &[3, 3, 3]);
+    ///
+    /// let mut a = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6]), &[3, 1, 2]).unwrap();
+    /// let mut expected = Tensor::<i32>::new(Some(&[1, 3, 5, 2, 4, 6]), &[2, 1, 3]).unwrap();
+    /// let b = a.swap_axes(0, 2).unwrap();
+    /// assert_eq!(b, expected);
+    ///
+    /// let mut a = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]), &[2, 3, 2]).unwrap();
+    /// let mut expected = Tensor::<i32>::new(Some(&[1, 3, 5, 2, 4, 6, 7, 9, 11, 8, 10, 12]), &[2, 2, 3]).unwrap();
+    /// let b = a.swap_axes(1, 2).unwrap();
+    /// assert_eq!(b, expected);
+    ///
+    /// let mut a = Tensor::<i32>::new(Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]), &[2, 3, 2]).unwrap();
+    /// let mut expected = Tensor::<i32>::new(Some(&[1, 3, 5, 2, 4, 6, 7, 9, 11, 8, 10, 12]), &[2, 2, 3]).unwrap();
+    /// let b = a.swap_axes(2, 1).unwrap();
+    /// assert_eq!(b, expected);
+    /// ```
+    pub fn swap_axes(&mut self, source: usize, destination: usize) -> Result<Self, TensorError> {
+        assert!(source < self.dims.len());
+        assert!(destination < self.dims.len());
+        let mut new_dims = self.dims.clone();
+        new_dims[source] = self.dims[destination];
+        new_dims[destination] = self.dims[source];
+
+        // now reconfigure the elements appropriately in the new array
+        //  eg. if we have a 3x3x3 array and we want to move the 0th axis to the 2nd position
+        //  we need to move the elements at 0, 1, 2, 3, 4, 5, 6, 7, 8 to 0, 3, 6, 1, 4, 7, 2, 5, 8
+        //  so we need to move the elements at 0, 1, 2 to 0, 3, 6
+        //  and the elements at 3, 4, 5 to 1, 4, 7
+        //  and the elements at 6, 7, 8 to 2, 5, 8
+        let cartesian_coords = new_dims
+            .iter()
+            .map(|d| 0..*d)
+            .multi_cartesian_product()
+            .collect::<Vec<Vec<usize>>>();
+
+        let mut output = Tensor::new(None, &new_dims)?;
+
+        for coord in cartesian_coords {
+            let mut old_coord = vec![0; self.dims.len()];
+
+            // now fetch the old index
+            for (i, c) in coord.iter().enumerate() {
+                if i == destination {
+                    old_coord[source] = *c;
+                } else if i == source {
+                    old_coord[destination] = *c;
+                } else {
+                    old_coord[i] = *c;
                 }
             }
             output.set(&coord, self.get(&old_coord));
@@ -764,7 +1001,9 @@ impl<T: Clone + TensorType> Tensor<T> {
     /// assert_eq!(a.dims(), &[27]);
     /// ```
     pub fn flatten(&mut self) {
-        self.dims = Vec::from([self.dims.iter().product::<usize>()]);
+        if !self.dims().is_empty() && (self.dims() != [0]) {
+            self.dims = Vec::from([self.dims.iter().product::<usize>()]);
+        }
     }
 
     /// Maps a function to tensors
@@ -800,6 +1039,61 @@ impl<T: Clone + TensorType> Tensor<T> {
         let mut t: Tensor<G> = Tensor::from(vec?.iter().cloned());
         t.reshape(self.dims());
         Ok(t)
+    }
+
+    /// Maps a function to tensors and enumerates in parallel
+    /// ```
+    /// use ezkl::tensor::{Tensor, TensorError};
+    /// let mut a = Tensor::<i32>::new(Some(&[1, 4]), &[2]).unwrap();
+    /// let mut c = a.par_enum_map::<_,_,TensorError>(|i, x| Ok(i32::pow(x + i as i32, 2))).unwrap();
+    /// assert_eq!(c, Tensor::from([1, 25].into_iter()));
+    /// ```
+    pub fn par_enum_map<
+        F: Fn(usize, T) -> Result<G, E> + std::marker::Send + std::marker::Sync,
+        G: TensorType + std::marker::Send + std::marker::Sync,
+        E: Error + std::marker::Send + std::marker::Sync,
+    >(
+        &self,
+        f: F,
+    ) -> Result<Tensor<G>, E>
+    where
+        T: std::marker::Send + std::marker::Sync,
+    {
+        let vec: Result<Vec<G>, E> = self
+            .inner
+            .par_iter()
+            .enumerate()
+            .map(move |(i, e)| f(i, e.clone()))
+            .collect();
+        let mut t: Tensor<G> = Tensor::from(vec?.iter().cloned());
+        t.reshape(self.dims());
+        Ok(t)
+    }
+
+    /// Maps a function to tensors and enumerates in parallel
+    /// ```
+    /// use ezkl::tensor::{Tensor, TensorError};
+    /// let mut a = Tensor::<i32>::new(Some(&[1, 4]), &[2]).unwrap();
+    /// let mut c = a.par_enum_map::<_,_,TensorError>(|i, x| Ok(i32::pow(x + i as i32, 2))).unwrap();
+    /// assert_eq!(c, Tensor::from([1, 25].into_iter()));
+    /// ```
+    pub fn par_enum_map_mut_filtered<
+        F: Fn(usize) -> Result<T, E> + std::marker::Send + std::marker::Sync,
+        E: Error + std::marker::Send + std::marker::Sync,
+    >(
+        &mut self,
+        filter_indices: &std::collections::HashSet<&usize>,
+        f: F,
+    ) -> Result<(), E>
+    where
+        T: std::marker::Send + std::marker::Sync,
+    {
+        self.inner
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(i, _)| filter_indices.contains(i))
+            .for_each(move |(i, e)| *e = f(i).unwrap());
+        Ok(())
     }
 }
 
@@ -903,7 +1197,7 @@ impl<T: TensorType + Neg<Output = T> + std::marker::Send + std::marker::Sync> Ne
     /// assert_eq!(result, expected);
     /// ```
     fn neg(self) -> Self {
-        let mut output = self.clone();
+        let mut output = self;
         output.par_iter_mut().for_each(|x| {
             *x = x.clone().neg();
         });

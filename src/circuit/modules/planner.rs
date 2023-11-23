@@ -15,6 +15,7 @@ use halo2_proofs::{
         Instance, Selector, TableColumn,
     },
 };
+use log::{trace, warn};
 
 /// A simple [`FloorPlanner`] that performs minimal optimizations.
 #[derive(Debug)]
@@ -60,6 +61,7 @@ impl<'a, F: Field, CS: Assignment<F> + 'a> fmt::Debug for ModuleLayouter<'a, F, 
         f.debug_struct("ModuleLayouter")
             .field("regions", &self.regions)
             .field("columns", &self.columns)
+            .field("total_constants", &self.total_constants)
             .finish()
     }
 }
@@ -70,7 +72,7 @@ impl<'a, F: Field, CS: Assignment<F>> ModuleLayouter<'a, F, CS> {
         let ret = ModuleLayouter {
             cs,
             constants,
-            regions: HashMap::from([(0, HashMap::default()), (1, HashMap::default())]),
+            regions: HashMap::default(),
             columns: HashMap::default(),
             region_idx: HashMap::default(),
             table_columns: vec![],
@@ -79,6 +81,17 @@ impl<'a, F: Field, CS: Assignment<F>> ModuleLayouter<'a, F, CS> {
             _marker: PhantomData,
         };
         Ok(ret)
+    }
+
+    ///
+    fn get_constant_col_cartesian_coord(
+        &self,
+        linear_coord: usize,
+        col_size: usize,
+    ) -> (usize, usize) {
+        let x = linear_coord / col_size;
+        let y = linear_coord % col_size;
+        (x, y)
     }
 }
 
@@ -92,16 +105,16 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> Layouter<F> for ModuleLayo
         NR: Into<String>,
     {
         // if the name contains the required substring we increment the current module idx
-        if Into::<String>::into(name()).contains("_new_module") {
-            self.current_module = self.regions.keys().max().unwrap_or(&0) + 1;
-        } else if Into::<String>::into(name()).contains("_enter_module_") {
+        if Into::<String>::into(name()).contains("_enter_module_") {
             let index = Into::<String>::into(name())
                 .split("_enter_module_")
                 .last()
                 .unwrap_or_else(|| panic!("Invalid module name"))
                 .parse::<usize>()
                 .unwrap_or_else(|_| panic!("Invalid module name"));
-            assert!(self.regions.contains_key(&index), "module does not exist");
+            if !self.regions.contains_key(&index) {
+                warn!("spawning module {}", index)
+            };
             self.current_module = index;
         }
 
@@ -164,27 +177,49 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> Layouter<F> for ModuleLayo
                 return Err(Error::NotEnoughColumnsForConstants);
             }
         } else {
-            let constants_column = self.constants[0];
-
             for (constant, advice) in constants_to_assign {
+                // read path from OS env
+                let (constant_column, y) = crate::graph::GLOBAL_SETTINGS.with(|settings| {
+                    match settings.borrow().as_ref() {
+                        Some(settings) => {
+                            let col_size = settings.available_col_size();
+                            let (x, y) = self
+                                .get_constant_col_cartesian_coord(self.total_constants, col_size);
+                            (self.constants[x], y)
+                        }
+                        None => (self.constants[0], self.total_constants),
+                    }
+                });
+
                 self.cs.assign_fixed(
                     || format!("Constant({:?})", constant.evaluate()),
-                    constants_column,
-                    self.total_constants,
+                    constant_column,
+                    y,
                     || Value::known(constant),
                 )?;
 
                 let region_module = self.region_idx[&advice.region_index];
 
                 self.cs.copy(
-                    constants_column.into(),
-                    self.total_constants,
+                    constant_column.into(),
+                    y,
                     advice.column,
                     *self.regions[&region_module][&advice.region_index] + advice.row_offset,
                 )?;
                 self.total_constants += 1;
             }
         }
+
+        trace!("region {} assigned", region_index);
+        trace!("total_constants: {:?}", self.total_constants);
+        let max_row_index = self
+            .columns
+            .iter()
+            .filter(|((module, _), _)| *module == self.current_module)
+            .map(|(_, row)| *row)
+            .max()
+            .unwrap_or(0);
+        trace!("max_row_index: {:?}", max_row_index);
 
         Ok(result)
     }
@@ -307,14 +342,17 @@ impl<'r, 'a, F: Field, CS: Assignment<F> + 'a> ModuleLayouterRegion<'r, 'a, F, C
     }
 }
 
-impl<'r, 'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SyncDeps
-    for ModuleLayouterRegion<'r, 'a, F, CS>
-{
-}
-
 impl<'r, 'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> RegionLayouter<F>
     for ModuleLayouterRegion<'r, 'a, F, CS>
 {
+    fn instance_value(
+        &mut self,
+        instance: Column<Instance>,
+        row: usize,
+    ) -> Result<Value<F>, Error> {
+        self.layouter.cs.query_instance(instance, row)
+    }
+
     fn enable_selector<'v>(
         &'v mut self,
         annotation: &'v (dyn Fn() -> String + 'v),

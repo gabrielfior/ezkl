@@ -11,7 +11,7 @@ pub fn i32_to_felt<F: PrimeField>(x: i32) -> F {
     }
 }
 
-/// Converts an i32 to a PrimeField element.
+/// Converts an i128 to a PrimeField element.
 pub fn i128_to_felt<F: PrimeField>(x: i128) -> F {
     if x >= 0 {
         F::from_u128(x as u128)
@@ -32,6 +32,21 @@ pub fn felt_to_i32<F: PrimeField + PartialOrd + Field>(x: F) -> i32 {
         let tmp: &[u8] = rep.as_ref();
         let lower_32 = u32::from_le_bytes(tmp[..4].try_into().unwrap());
         lower_32 as i32
+    }
+}
+
+/// Converts a PrimeField element to an i128.
+pub fn felt_to_f64<F: PrimeField + PartialOrd + Field>(x: F) -> f64 {
+    if x > F::from_u128(i128::MAX as u128) {
+        let rep = (-x).to_repr();
+        let negtmp: &[u8] = rep.as_ref();
+        let lower_128: u128 = u128::from_le_bytes(negtmp[..16].try_into().unwrap());
+        -(lower_128 as f64)
+    } else {
+        let rep = (x).to_repr();
+        let tmp: &[u8] = rep.as_ref();
+        let lower_128: u128 = u128::from_le_bytes(tmp[..16].try_into().unwrap());
+        lower_128 as f64
     }
 }
 

@@ -1,12 +1,15 @@
 target
+pkg
 data
 *.csv
+!examples/notebooks/eth_price.csv
 *.ipynb_checkpoints
 *.sol
 !QuantizeData.sol
 !TestReads.sol
 !AttestData.sol
 !VerifierBase.sol
+!LoadInstances.sol
 *.pf
 *.vk
 *.pk
@@ -40,3 +43,6 @@ var/
 *.egg
 .vscode/
 *.whl
+*.bak
+node_modules
+timingData.json

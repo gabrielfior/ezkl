@@ -15,7 +15,7 @@ pub enum PolyOp<F: PrimeField + TensorType + PartialOrd> {
     Conv {
         kernel: Tensor<F>,
         bias: Option<Tensor<F>>,
-        padding: (usize, usize),
+        padding: [(usize, usize); 2],
         stride: (usize, usize),
     },
     Downsample {
@@ -26,37 +26,33 @@ pub enum PolyOp<F: PrimeField + TensorType + PartialOrd> {
     DeConv {
         kernel: Tensor<F>,
         bias: Option<Tensor<F>>,
-        padding: (usize, usize),
+        padding: [(usize, usize); 2],
         output_padding: (usize, usize),
         stride: (usize, usize),
     },
     SumPool {
-        padding: (usize, usize),
+        padding: [(usize, usize); 2],
         stride: (usize, usize),
         kernel_shape: (usize, usize),
     },
-    Add {
-        a: Option<Tensor<F>>,
-    },
+    Add,
     Sub,
     Neg,
-    Mult {
-        a: Option<Tensor<F>>,
-    },
+    Mult,
     Identity,
     Reshape(Vec<usize>),
     MoveAxis {
         source: usize,
         destination: usize,
     },
-    Gather {
-        dim: usize,
-        index: Tensor<usize>,
-    },
     Flatten(Vec<usize>),
-    Pad(usize, usize),
+    Pad([(usize, usize); 2]),
     Sum {
         axes: Vec<usize>,
+    },
+    Prod {
+        axes: Vec<usize>,
+        len_prod: usize,
     },
     Pow(u32),
     Pack(u32, u32),
@@ -73,6 +69,10 @@ pub enum PolyOp<F: PrimeField + TensorType + PartialOrd> {
     Resize {
         scale_factor: Vec<usize>,
     },
+    Not,
+    And,
+    Or,
+    Xor,
 }
 
 impl<F: PrimeField + TensorType + PartialOrd> PolyOp<F> {}
@@ -86,38 +86,47 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
     }
 
     fn as_string(&self) -> String {
-        let name = match &self {
-            PolyOp::MoveAxis { .. } => "MOVEAXIS",
-            PolyOp::Downsample { .. } => "DOWNSAMPLE",
-            PolyOp::Resize { .. } => "RESIZE",
-            PolyOp::Iff => "IFF",
-            PolyOp::Einsum { .. } => "EINSUM",
-            PolyOp::Identity => "IDENTITY",
-            PolyOp::Reshape(_) => "RESHAPE",
-            PolyOp::Flatten(_) => "FLATTEN",
-            PolyOp::Pad(_, _) => "PAD",
-            PolyOp::Add { .. } => "ADD",
-            PolyOp::Mult { .. } => "MULT",
-            PolyOp::Sub => "SUB",
-            PolyOp::Sum { .. } => "SUM",
-            PolyOp::Pow(_) => "POW",
-            PolyOp::Pack(_, _) => "PACK",
-            PolyOp::GlobalSumPool => "GLOBALSUMPOOL",
-            PolyOp::Conv { .. } => "CONV",
-            PolyOp::DeConv { .. } => "DECONV",
-            PolyOp::SumPool { .. } => "SUMPOOL",
-            PolyOp::Gather { .. } => "GATHER",
-            PolyOp::Concat { .. } => "CONCAT",
-            PolyOp::Slice { .. } => "SLICE",
-            PolyOp::Neg => "NEG",
-        };
-        name.into()
+        match &self {
+            PolyOp::MoveAxis { .. } => "MOVEAXIS".into(),
+            PolyOp::Downsample { .. } => "DOWNSAMPLE".into(),
+            PolyOp::Resize { .. } => "RESIZE".into(),
+            PolyOp::Iff => "IFF".into(),
+            PolyOp::Einsum { equation, .. } => format!("EINSUM {}", equation),
+            PolyOp::Identity => "IDENTITY".into(),
+            PolyOp::Reshape(shape) => format!("RESHAPE (shape={:?})", shape),
+            PolyOp::Flatten(_) => "FLATTEN".into(),
+            PolyOp::Pad(_) => "PAD".into(),
+            PolyOp::Add => "ADD".into(),
+            PolyOp::Mult => "MULT".into(),
+            PolyOp::Sub => "SUB".into(),
+            PolyOp::Sum { .. } => "SUM".into(),
+            PolyOp::Prod { .. } => "PROD".into(),
+            PolyOp::Pow(_) => "POW".into(),
+            PolyOp::Pack(_, _) => "PACK".into(),
+            PolyOp::GlobalSumPool => "GLOBALSUMPOOL".into(),
+            PolyOp::Conv { .. } => "CONV".into(),
+            PolyOp::DeConv { .. } => "DECONV".into(),
+            PolyOp::SumPool { .. } => "SUMPOOL".into(),
+            PolyOp::Concat { axis } => format!("CONCAT (axis={})", axis),
+            PolyOp::Slice { axis, start, end } => {
+                format!("SLICE (axis={}, start={}, end={})", axis, start, end)
+            }
+            PolyOp::Neg => "NEG".into(),
+            PolyOp::Not => "NOT".into(),
+            PolyOp::And => "AND".into(),
+            PolyOp::Or => "OR".into(),
+            PolyOp::Xor => "XOR".into(),
+        }
     }
 
     /// Matches a [Op] to an operation in the `tensor::ops` module.
     fn f(&self, inputs: &[Tensor<F>]) -> Result<ForwardResult<F>, TensorError> {
         let mut inputs = inputs.to_vec();
         let res = match &self {
+            PolyOp::And => tensor::ops::and(&inputs[0], &inputs[1]),
+            PolyOp::Or => tensor::ops::or(&inputs[0], &inputs[1]),
+            PolyOp::Xor => tensor::ops::xor(&inputs[0], &inputs[1]),
+            PolyOp::Not => tensor::ops::not(&inputs[0]),
             PolyOp::Downsample {
                 axis,
                 stride,
@@ -126,7 +135,6 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
             PolyOp::Resize { scale_factor } => tensor::ops::resize(&inputs[0], scale_factor),
             PolyOp::Iff => tensor::ops::iff(&inputs[0], &inputs[1], &inputs[2]),
             PolyOp::Einsum { equation } => tensor::ops::einsum(equation, &inputs),
-            PolyOp::Gather { dim, index } => tensor::ops::gather(&inputs[0], *dim, index),
             PolyOp::Identity => Ok(inputs[0].clone()),
             PolyOp::Reshape(new_dims) => {
                 let mut t = inputs[0].clone();
@@ -142,26 +150,16 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
                 t.reshape(new_dims);
                 Ok(t)
             }
-            PolyOp::Pad(dim1, dim2) => {
+            PolyOp::Pad(p) => {
                 if 1 != inputs.len() {
                     return Err(TensorError::DimMismatch("pad inputs".to_string()));
                 }
-                tensor::ops::pad(&inputs[0], (*dim1, *dim2))
+                tensor::ops::pad(&inputs[0], *p)
             }
-            PolyOp::Add { a } => {
-                if let Some(a) = a {
-                    inputs.push(a.clone());
-                }
-                tensor::ops::add(&inputs)
-            }
+            PolyOp::Add => tensor::ops::add(&inputs),
             PolyOp::Neg => tensor::ops::neg(&inputs[0]),
             PolyOp::Sub => tensor::ops::sub(&inputs),
-            PolyOp::Mult { a } => {
-                if let Some(a) = a {
-                    inputs.push(a.clone());
-                }
-                tensor::ops::mult(&inputs)
-            }
+            PolyOp::Mult => tensor::ops::mult(&inputs),
             PolyOp::Conv {
                 kernel: a,
                 bias,
@@ -211,12 +209,15 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
                 }
                 tensor::ops::sum_axes(&inputs[0], axes)
             }
+            PolyOp::Prod { axes, .. } => {
+                if 1 != inputs.len() {
+                    return Err(TensorError::DimMismatch("prod inputs".to_string()));
+                }
+                tensor::ops::prod_axes(&inputs[0], axes)
+            }
             PolyOp::GlobalSumPool => unreachable!(),
             PolyOp::Concat { axis } => {
-                if inputs.len() < 2 {
-                    return Err(TensorError::DimMismatch("concat inputs".to_string()));
-                }
-                tensor::ops::concat(&inputs, *axis)
+                tensor::ops::concat(&inputs.iter().collect::<Vec<_>>(), *axis)
             }
             PolyOp::Slice { axis, start, end } => {
                 if 1 != inputs.len() {
@@ -241,6 +242,10 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
         let mut values = values.to_vec();
 
         Ok(Some(match self {
+            PolyOp::Xor => layouts::xor(config, region, values[..].try_into()?)?,
+            PolyOp::Or => layouts::or(config, region, values[..].try_into()?)?,
+            PolyOp::And => layouts::and(config, region, values[..].try_into()?)?,
+            PolyOp::Not => layouts::not(config, region, values[..].try_into()?)?,
             PolyOp::MoveAxis {
                 source,
                 destination,
@@ -255,12 +260,12 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
             }
             PolyOp::Neg => layouts::neg(config, region, values[..].try_into()?)?,
             PolyOp::Iff => layouts::iff(config, region, values[..].try_into()?)?,
-            PolyOp::Einsum { equation } => layouts::einsum(config, region, &mut values, equation)?,
-            PolyOp::Gather { dim, index } => {
-                tensor::ops::gather(&values[0].get_inner_tensor()?, *dim, index)?.into()
-            }
+            PolyOp::Einsum { equation } => layouts::einsum(config, region, &values, equation)?,
             PolyOp::Sum { axes } => {
                 layouts::sum_axes(config, region, values[..].try_into()?, axes)?
+            }
+            PolyOp::Prod { axes, .. } => {
+                layouts::prod_axes(config, region, values[..].try_into()?, axes)?
             }
             PolyOp::Conv {
                 kernel,
@@ -306,28 +311,19 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
                 *stride,
                 *kernel_shape,
             )?,
-            PolyOp::Add { a } => {
-                if let Some(a) = a {
-                    values.push(a.clone().into());
-                }
-
-                layouts::pairwise(config, region, values[..].try_into()?, BaseOp::Add)?
-            }
+            PolyOp::Add => layouts::pairwise(config, region, values[..].try_into()?, BaseOp::Add)?,
             PolyOp::Sub => layouts::pairwise(config, region, values[..].try_into()?, BaseOp::Sub)?,
-            PolyOp::Mult { a } => {
-                if let Some(a) = a {
-                    values.push(a.clone().into());
-                }
+            PolyOp::Mult => {
                 layouts::pairwise(config, region, values[..].try_into()?, BaseOp::Mult)?
             }
             PolyOp::Identity => layouts::identity(config, region, values[..].try_into()?)?,
             PolyOp::Reshape(d) | PolyOp::Flatten(d) => layouts::reshape(values[..].try_into()?, d)?,
-            PolyOp::Pad(p1, p2) => {
+            PolyOp::Pad(p) => {
                 if values.len() != 1 {
                     return Err(Box::new(TensorError::DimError));
                 }
                 let mut input = values[0].clone();
-                input.pad((*p1, *p2))?;
+                input.pad(*p)?;
                 input
             }
             PolyOp::Pow(exp) => layouts::pow(config, region, values[..].try_into()?, *exp)?,
@@ -335,20 +331,16 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
                 layouts::pack(config, region, values[..].try_into()?, *base, *scale)?
             }
             PolyOp::GlobalSumPool => unreachable!(),
-            PolyOp::Concat { axis } => {
-                if values.len() < 2 {
-                    return Err(Box::new(TensorError::DimError));
-                }
-                layouts::concat(values[..].try_into()?, axis)?
-            }
+            PolyOp::Concat { axis } => layouts::concat(values[..].try_into()?, axis)?,
             PolyOp::Slice { axis, start, end } => {
                 layouts::slice(config, region, values[..].try_into()?, axis, start, end)?
             }
         }))
     }
 
-    fn out_scale(&self, in_scales: Vec<u32>, _g: u32) -> u32 {
+    fn out_scale(&self, in_scales: Vec<crate::Scale>) -> crate::Scale {
         match self {
+            PolyOp::Xor | PolyOp::Or | PolyOp::And | PolyOp::Not => 0,
             PolyOp::Neg => in_scales[0],
             PolyOp::MoveAxis { .. } => in_scales[0],
             PolyOp::Downsample { .. } => in_scales[0],
@@ -361,8 +353,7 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
                 }
                 scale
             }
-            PolyOp::Gather { .. } => in_scales[0],
-
+            PolyOp::Prod { len_prod, .. } => in_scales[0] * (*len_prod as crate::Scale),
             PolyOp::Sum { .. } => in_scales[0],
             PolyOp::Conv { kernel, bias, .. } => {
                 let kernel_scale = match kernel.scale() {
@@ -395,39 +386,23 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
                 output_scale
             }
             PolyOp::SumPool { .. } => in_scales[0],
-            PolyOp::Add { a } => {
+            PolyOp::Add => {
                 let mut scale_a = 0;
                 let scale_b = in_scales[0];
-                if let Some(a) = a {
-                    let a_scale = match a.scale() {
-                        Some(s) => s,
-                        None => panic!("scale must be set for add constant"),
-                    };
-                    scale_a += a_scale;
-                } else {
-                    scale_a += in_scales[1];
-                }
+                scale_a += in_scales[1];
                 assert_eq!(scale_a, scale_b);
                 scale_a
             }
             PolyOp::Sub => in_scales[0],
-            PolyOp::Mult { a } => {
+            PolyOp::Mult => {
                 let mut scale = in_scales[0];
-                if let Some(a) = a {
-                    let a_scale = match a.scale() {
-                        Some(s) => s,
-                        None => panic!("scale must be set for add constant"),
-                    };
-                    scale += a_scale;
-                } else {
-                    scale += in_scales[1];
-                }
+                scale += in_scales[1];
                 scale
             }
             PolyOp::Identity => in_scales[0],
             PolyOp::Reshape(_) | PolyOp::Flatten(_) => in_scales[0],
-            PolyOp::Pad(_, _) => in_scales[0],
-            PolyOp::Pow(pow) => in_scales[0] * (*pow),
+            PolyOp::Pad(_) => in_scales[0],
+            PolyOp::Pow(pow) => in_scales[0] * (*pow as crate::Scale),
             PolyOp::Pack(_, _) => in_scales[0],
             PolyOp::GlobalSumPool => in_scales[0],
             PolyOp::Concat { axis: _ } => in_scales[0],
@@ -435,17 +410,8 @@ impl<F: PrimeField + TensorType + PartialOrd + Serialize + for<'de> Deserialize<
         }
     }
 
-    fn rescale(&self, input_scales: Vec<u32>, _: u32) -> Box<dyn Op<F>> {
-        let inputs_to_scale = self.requires_homogenous_input_scales();
-        // creates a rescaled op if the inputs are not homogenous
-        homogenize_input_scales::<F>(self.clone(), input_scales, inputs_to_scale).unwrap()
-    }
-
     fn requires_homogenous_input_scales(&self) -> Vec<usize> {
-        if matches!(
-            self,
-            PolyOp::Add { .. } | PolyOp::Sub | PolyOp::Mult { .. } | PolyOp::Einsum { .. }
-        ) {
+        if matches!(self, PolyOp::Add { .. } | PolyOp::Sub) {
             vec![0, 1]
         } else if matches!(self, PolyOp::Iff) {
             vec![1, 2]

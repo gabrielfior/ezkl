@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ezkl::circuit::poly::PolyOp;
 use ezkl::circuit::*;
-use ezkl::execute::create_proof_circuit_kzg;
+use ezkl::pfsys::create_proof_circuit_kzg;
 use ezkl::pfsys::TranscriptType;
 use ezkl::pfsys::{create_keys, srs::gen_srs};
 use ezkl::tensor::*;
@@ -37,9 +37,9 @@ impl Circuit<Fr> for MyCircuit {
     fn configure(cs: &mut ConstraintSystem<Fr>) -> Self::Config {
         let len = unsafe { LEN };
 
-        let a = VarTensor::new_advice(cs, K, len);
-        let b = VarTensor::new_advice(cs, K, len);
-        let output = VarTensor::new_advice(cs, K, len);
+        let a = VarTensor::new_advice(cs, K, 1, len);
+        let b = VarTensor::new_advice(cs, K, 1, len);
+        let output = VarTensor::new_advice(cs, K, 1, len);
 
         Self::Config::configure(cs, &[a, b], &output, CheckMode::UNSAFE)
     }
@@ -52,9 +52,9 @@ impl Circuit<Fr> for MyCircuit {
         layouter.assign_region(
             || "",
             |region| {
-                let mut region = region::RegionCtx::new(region, 0);
+                let mut region = region::RegionCtx::new(region, 0, 1);
                 config
-                    .layout(&mut region, &self.inputs, Box::new(PolyOp::Add { a: None }))
+                    .layout(&mut region, &self.inputs, Box::new(PolyOp::Add))
                     .unwrap();
                 Ok(())
             },
@@ -98,11 +98,12 @@ fn runadd(c: &mut Criterion) {
                 let prover = create_proof_circuit_kzg(
                     circuit.clone(),
                     &params,
-                    vec![],
+                    None,
                     &pk,
-                    TranscriptType::Blake,
+                    TranscriptType::EVM,
                     SingleStrategy::new(&params),
                     CheckMode::SAFE,
+                    None,
                 );
                 prover.unwrap();
             });

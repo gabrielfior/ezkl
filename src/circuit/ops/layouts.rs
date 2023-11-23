@@ -7,10 +7,16 @@ use std::{
 use halo2_proofs::circuit::Value;
 use halo2curves::ff::PrimeField;
 use itertools::Itertools;
-use log::error;
+use log::{error, trace};
+use rayon::{
+    prelude::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    },
+    slice::ParallelSliceMut,
+};
 
 use super::{
-    chip::{BaseConfig, CheckMode, CircuitError},
+    chip::{BaseConfig, CircuitError},
     region::RegionCtx,
 };
 use crate::{
@@ -18,11 +24,7 @@ use crate::{
     fieldutils::i128_to_felt,
     tensor::{
         get_broadcasted_shape,
-        ops::{
-            accumulated, add, conv as non_accum_conv, deconv as non_accum_deconv,
-            dot as non_accum_dot, einsum as non_accum_einsum, max_pool2d as non_accum_max_pool2d,
-            mult, pack as non_accum_pack, sub, sum as non_accum_sum, sumpool as non_accum_sumpool,
-        },
+        ops::{accumulated, add, mult, sub},
         Tensor, TensorError, ValType,
     },
 };
@@ -30,7 +32,8 @@ use crate::{
 use super::*;
 use crate::circuit::ops::lookup::LookupOp;
 
-fn overflowed_len(starting_idx: usize, mut total_len: usize, column_len: usize) -> usize {
+///
+pub fn overflowed_len(starting_idx: usize, mut total_len: usize, column_len: usize) -> usize {
     let mut idx = starting_idx;
     // let x = idx / column_len;
     let y = idx % column_len;
@@ -56,67 +59,104 @@ pub fn dot<F: PrimeField + TensorType + PartialOrd>(
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 2],
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
+    region.flush();
+    // time this entire function run
+    let global_start = instant::Instant::now();
+
+    let mut values = values.clone();
+    // this section has been optimized to death, don't mess with it
+    let mut removal_indices = values[0].get_const_zero_indices()?;
+    let second_zero_indices = values[1].get_const_zero_indices()?;
+    removal_indices.extend(second_zero_indices);
+    removal_indices.par_sort_unstable();
+    removal_indices.dedup();
+
+    // is already sorted
+    values[0].remove_indices(&mut removal_indices, true)?;
+    values[1].remove_indices(&mut removal_indices, true)?;
+
+    let elapsed = global_start.elapsed();
+    trace!("filtering const zero indices took: {:?}", elapsed);
+
     if values[0].len() != values[1].len() {
         return Err(Box::new(TensorError::DimMismatch("dot".to_string())));
     }
 
+    // if empty return a const
+    if values[0].is_empty() && values[1].is_empty() {
+        return Ok(Tensor::from([ValType::Constant(F::ZERO)].into_iter()).into());
+    }
+
+    let start = instant::Instant::now();
     let mut inputs = vec![];
+    let block_width = config.output.num_inner_cols();
+
     let mut assigned_len = 0;
-    for (i, input) in values.iter().enumerate() {
+    for (i, input) in values.iter_mut().enumerate() {
+        input.pad_to_zero_rem(block_width)?;
         let inp = {
-            let (res, len) =
-                region.assign_with_duplication(&config.inputs[i], input, &config.check_mode)?;
+            let (res, len) = region.assign_with_duplication(
+                &config.inputs[i],
+                input,
+                &config.check_mode,
+                false,
+            )?;
             assigned_len = len;
             res.get_inner()?
         };
         inputs.push(inp);
     }
+    let elapsed = start.elapsed();
+    trace!("assigning inputs took: {:?}", elapsed);
 
     // Now we can assign the dot product
-    let accumulated_dot = accumulated::dot(&[inputs[0].clone(), inputs[1].clone()])
+    // time this step
+    let start = instant::Instant::now();
+    let accumulated_dot = accumulated::dot(&[inputs[0].clone(), inputs[1].clone()], block_width)
         .expect("accum poly: dot op failed");
+    let elapsed = start.elapsed();
+    trace!("calculating accumulated dot took: {:?}", elapsed);
 
+    let start = instant::Instant::now();
     let (output, output_assigned_len) = region.assign_with_duplication(
         &config.output,
         &accumulated_dot.into(),
         &config.check_mode,
+        true,
     )?;
-
-    assert_eq!(assigned_len, output_assigned_len);
+    let elapsed = start.elapsed();
+    trace!("assigning output took: {:?}", elapsed);
 
     // enable the selectors
-    (0..assigned_len).for_each(|i| {
-        let (x, y) = config.output.cartesian_coord(region.offset() + i);
-        // hop over duplicates at start of column
-        if y == 0 && i > 0 {
-            return;
-        }
-        let selector = if i == 0 {
-            config.selectors.get(&(BaseOp::Mult, x))
-        } else {
-            config.selectors.get(&(BaseOp::Dot, x))
-        };
-        region.enable(selector, y).unwrap();
-    });
+    if !region.is_dummy() {
+        (0..output_assigned_len).for_each(|i| {
+            let (x, _, z) = config
+                .output
+                .cartesian_coord(region.linear_coord() + i * block_width);
+            // hop over duplicates at start of column
+            if z == 0 && i > 0 {
+                return;
+            }
+            let selector = if i == 0 {
+                config.selectors.get(&(BaseOp::DotInit, x, 0))
+            } else {
+                config.selectors.get(&(BaseOp::Dot, x, 0))
+            };
+            region.enable(selector, z).unwrap();
+        });
+    }
 
     let last_elem = output
         .get_slice(&[output.len() - 1..output.len()])
-        .expect("accum poly: failed to fetch last elem");
-
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        let safe_dot = non_accum_dot(&inputs[..]).map_err(|e| {
-            error!("{}", e);
-            halo2_proofs::plonk::Error::Synthesis
-        })?;
-
-        assert_eq!(
-            Into::<Tensor<i32>>::into(last_elem.get_inner()?),
-            Into::<Tensor<i32>>::into(safe_dot),
-        );
-    }
+        .expect("dot: failed to fetch last elem");
 
     region.increment(assigned_len);
+
     // last element is the result
+
+    let elapsed = global_start.elapsed();
+    trace!("dot layout took: {:?}, row {}", elapsed, region.row());
+    trace!("----------------------------");
     Ok(last_elem)
 }
 
@@ -124,27 +164,13 @@ pub fn dot<F: PrimeField + TensorType + PartialOrd>(
 pub fn einsum<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
-    inputs: &mut [ValTensor<F>],
+    inputs: &[ValTensor<F>],
     equation: &str,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
-    // Parse equation into an operation
-    let original_eq = equation.to_string();
-
     let mut equation = equation.split("->");
     let inputs_eq = equation.next().unwrap();
     let output_eq = equation.next().unwrap();
     let inputs_eq = inputs_eq.split(',').collect::<Vec<_>>();
-
-    for (i, input) in inputs.iter_mut().enumerate() {
-        if input.dims().len() != inputs_eq[i].len()
-            && input.dims().len() == 1
-            && inputs_eq[i].len() == 2
-        {
-            input.reshape(&[1, input.dims()[0]])?;
-        } else if input.dims().len() != inputs_eq[i].len() {
-            return Err(Box::new(TensorError::DimMismatch("einsum".to_string())));
-        }
-    }
 
     // Check that the number of inputs matches the number of inputs in the equation
     if inputs.len() != inputs_eq.len() {
@@ -198,6 +224,19 @@ pub fn einsum<F: PrimeField + TensorType + PartialOrd>(
         .filter(|&x| !common_indices_to_inputs.contains(x))
         .collect::<Vec<_>>();
 
+    let non_common_coord_size = non_common_indices
+        .iter()
+        .map(|d| {
+            // If the current index is in the output equation, then the slice should be the current coordinate
+            if output_eq.contains(**d) {
+                1
+            // Otherwise, the slice should be the entire dimension of the input tensor
+            } else {
+                *indices_to_size.get(d).unwrap()
+            }
+        })
+        .product::<usize>();
+
     let cartesian_coord = output_shape
         .iter()
         .map(|d| 0..*d)
@@ -224,52 +263,7 @@ pub fn einsum<F: PrimeField + TensorType + PartialOrd>(
         common_coord.push(vec![]);
     }
 
-    let non_common_coord_size = non_common_indices
-        .iter()
-        .map(|d| {
-            // If the current index is in the output equation, then the slice should be the current coordinate
-            if output_eq.contains(**d) {
-                1
-            // Otherwise, the slice should be the entire dimension of the input tensor
-            } else {
-                *indices_to_size.get(d).unwrap()
-            }
-        })
-        .product::<usize>();
-
-    // if region dummy then increment region by total used len and return
-    if region.is_dummy() {
-        let non_common_indices_size = non_common_indices
-            .into_iter()
-            .filter(|c| !output_eq.contains(**c))
-            .map(|c| indices_to_size[c])
-            .product::<usize>();
-
-        if non_common_indices_size > 1 {
-            let increment = output_shape.iter().product::<usize>()
-                * (2 * common_indices_to_inputs
-                    .into_iter()
-                    .filter(|c| !output_eq.contains(*c))
-                    .map(|c| indices_to_size[&c])
-                    .product::<usize>()
-                    * non_common_indices_size
-                    - 1);
-            region.increment(increment);
-        } else {
-            let vanilla_len = output_shape.iter().product::<usize>()
-                * (common_indices_to_inputs
-                    .into_iter()
-                    .filter(|c| !output_eq.contains(*c))
-                    .map(|c| indices_to_size[&c])
-                    .product::<usize>());
-            let overflowed_len =
-                overflowed_len(region.offset(), vanilla_len, config.output.col_size());
-            region.increment(overflowed_len);
-        }
-        return Ok(output.into());
-    }
-
-    output.iter_mut().enumerate().for_each(|(i, o)| {
+    let inner_loop_function = |i: usize, region: &mut RegionCtx<'_, F>| -> ValType<F> {
         let coord = cartesian_coord[i].clone();
         // Compute the slice of each input tensor given the current coordinate of the output tensor
         let inputs = (0..inputs.len())
@@ -291,11 +285,11 @@ pub fn einsum<F: PrimeField + TensorType + PartialOrd>(
 
         // in this case its just a dot product :)
         if non_common_coord_size == 1 && inputs.len() == 2 {
-            *o = dot(config, region, inputs[..].try_into().unwrap())
+            dot(config, region, inputs[..].try_into().unwrap())
                 .unwrap()
                 .get_inner_tensor()
                 .unwrap()[0]
-                .clone();
+                .clone()
         } else {
             let mut prod = None;
 
@@ -330,7 +324,7 @@ pub fn einsum<F: PrimeField + TensorType + PartialOrd>(
                         pair[1..]
                             .iter()
                             .fold(ValTensor::from(pair[0].clone()), |acc, x| {
-                                pairwise(config, region, &[acc, x.clone().into()], BaseOp::Mult)
+                                pairwise(config, region, &[acc, (*x).clone().into()], BaseOp::Mult)
                                     .unwrap()
                             });
 
@@ -349,108 +343,805 @@ pub fn einsum<F: PrimeField + TensorType + PartialOrd>(
                     }
                 }
             }
-
-            *o = prod.unwrap().get_inner_tensor().unwrap()[0].clone();
+            prod.unwrap().get_inner_tensor().unwrap()[0].clone()
         }
-    });
+    };
 
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(ValTensor::from(output.clone()).get_inner()?)
+    region.flush();
+    if !region.is_dummy() {
+        output.iter_mut().enumerate().for_each(|(i, o)| {
+            *o = inner_loop_function(i, region);
+        });
+    } else {
+        region.dummy_loop(&mut output, inner_loop_function)?;
+    }
+
+    let output: ValTensor<F> = output.into();
+
+    Ok(output)
+}
+
+fn _sort_descending<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let input = values[0].clone();
+
+    // assert input is flat
+    assert_eq!(input.dims().len(), 1);
+
+    let is_assigned = !input.any_unknowns();
+
+    let sorted = if is_assigned {
+        input
+            .get_int_evals()?
             .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let safe_einsum = non_accum_einsum(
-                &original_eq,
-                &inputs
-                    .iter()
-                    .map(|x| x.get_inner().unwrap())
-                    .collect::<Vec<Tensor<_>>>(),
-            )
-            .map_err(|e| {
-                error!("{}", e);
-                halo2_proofs::plonk::Error::Synthesis
-            })?;
+            .sorted_by(|a, b| b.cmp(a))
+            .map(|x| Value::known(i128_to_felt(*x)))
+            .collect::<Tensor<_>>()
+    } else {
+        Tensor::new(
+            Some(&vec![Value::<F>::unknown(); input.len()]),
+            &[input.len()],
+        )?
+    };
 
-            assert_eq!(
-                Into::<Tensor<i32>>::into(ValTensor::from(output.clone()).get_inner()?),
-                Into::<Tensor<i32>>::into(safe_einsum),
-            )
+    let assigned_sort = region.assign(&config.inputs[0], &sorted.into())?;
+    let input = region.assign(&config.inputs[1], &input)?;
+
+    let mut unit = Tensor::from(vec![F::from(1)].into_iter());
+    unit.set_visibility(&crate::graph::Visibility::Fixed);
+    let unit = region.assign(&config.output, &unit.into())?;
+
+    region.increment(assigned_sort.len());
+
+    for i in 0..assigned_sort.len() - 1 {
+        // assert that each thing in turn is larger than the next
+        let window_a = assigned_sort.get_slice(&[i..i + 1])?;
+        let window_b = assigned_sort.get_slice(&[i + 1..i + 2])?;
+
+        let window_b_minus_1 = pairwise(config, region, &[window_b, unit.clone()], BaseOp::Sub)?;
+
+        let diff = pairwise(
+            config,
+            region,
+            &[window_a.clone(), window_b_minus_1.clone()],
+            BaseOp::Sub,
+        )?;
+        let greater_than = nonlinearity(
+            config,
+            region,
+            &[diff],
+            &LookupOp::GreaterThan { a: 0.0.into() },
+        )?;
+
+        enforce_equality(config, region, &[unit.clone(), greater_than.clone()])?;
+
+        // now assert that the elem is in the original vector
+        let is_present = equals(config, region, &[window_a, input.clone()])?;
+        let sum_equals = sum(config, region, &[is_present])?;
+        let greater_than = nonlinearity(
+            config,
+            region,
+            &[sum_equals],
+            &LookupOp::GreaterThan { a: 0.0.into() },
+        )?;
+
+        enforce_equality(config, region, &[unit.clone(), greater_than.clone()])?;
+    }
+
+    Ok(assigned_sort)
+}
+
+fn _sort_ascending<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let input = values[0].clone();
+
+    // assert input is flat
+    assert_eq!(input.dims().len(), 1);
+
+    let is_assigned = !input.any_unknowns();
+
+    let sorted = if is_assigned {
+        input
+            .get_int_evals()?
+            .iter()
+            .sorted_by(|a, b| a.cmp(b))
+            .map(|x| Value::known(input.get_felt_evals().unwrap().get(&[*x as usize])))
+            .collect::<Tensor<_>>()
+    } else {
+        Tensor::new(
+            Some(&vec![Value::<F>::unknown(); input.len()]),
+            &[input.len()],
+        )?
+    };
+
+    let assigned_sort = region.assign(&config.inputs[0], &sorted.into())?;
+
+    let mut unit = Tensor::from(vec![F::from(1)].into_iter());
+    unit.set_visibility(&crate::graph::Visibility::Fixed);
+    let unit = region.assign(&config.inputs[1], &unit.into())?;
+
+    region.increment(assigned_sort.len());
+
+    for i in 0..assigned_sort.len() - 1 {
+        // assert that each thing in turn is larger than the next
+        let window_a = assigned_sort.get_slice(&[i..i + 1])?;
+        let window_b = assigned_sort.get_slice(&[i + 1..i + 2])?;
+
+        let window_a_minus_1 = pairwise(
+            config,
+            region,
+            &[window_a.clone(), unit.clone()],
+            BaseOp::Sub,
+        )?;
+
+        let diff = pairwise(
+            config,
+            region,
+            &[window_b.clone(), window_a_minus_1.clone()],
+            BaseOp::Sub,
+        )?;
+        let greater_than = nonlinearity(
+            config,
+            region,
+            &[diff],
+            &LookupOp::GreaterThan { a: 0.0.into() },
+        )?;
+
+        enforce_equality(config, region, &[unit.clone(), greater_than.clone()])?;
+
+        // now assert that the elem is in the original vector
+        let is_present = equals(config, region, &[window_a, input.clone()])?;
+        let sum_equals = sum(config, region, &[is_present])?;
+        let greater_than = nonlinearity(
+            config,
+            region,
+            &[sum_equals],
+            &LookupOp::GreaterThan { a: 0.0.into() },
+        )?;
+
+        enforce_equality(config, region, &[unit.clone(), greater_than.clone()])?;
+    }
+
+    Ok(assigned_sort)
+}
+
+///
+fn _select_topk<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    k: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let sorted = _sort_descending(config, region, values)?.get_slice(&[0..k])?;
+    Ok(sorted)
+}
+
+/// Select top k elements
+pub fn topk_axes<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    k: usize,
+    dim: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let topk_at_k = move |config: &BaseConfig<F>,
+                          region: &mut RegionCtx<F>,
+                          values: &[ValTensor<F>; 1]|
+          -> Result<ValTensor<F>, Box<dyn Error>> {
+        _select_topk(config, region, values, k)
+    };
+
+    let output: ValTensor<F> = multi_dim_axes_op(config, region, values, &[dim], topk_at_k)?;
+
+    Ok(output)
+}
+
+fn select<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+    dim_indices: ValTensor<F>,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let (mut input, index) = (values[0].clone(), values[1].clone());
+    input.flatten();
+
+    // assert we have a single index
+    assert_eq!(index.dims().iter().product::<usize>(), 1);
+    assert!(dim_indices.all_prev_assigned() || region.is_dummy());
+
+    let is_assigned = !input.any_unknowns() && !index.any_unknowns();
+
+    let output: ValTensor<F> = if is_assigned {
+        Tensor::from(
+            index
+                .get_int_evals()?
+                .par_iter()
+                .map(|x| Value::known(input.get_felt_evals().unwrap().get(&[*x as usize])))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+    } else {
+        Tensor::new(
+            Some(&vec![Value::<F>::unknown(); index.len()]),
+            &[index.len()],
+        )?
+    }
+    .into();
+
+    let local_mask = equals(config, region, &[dim_indices.clone(), index]).unwrap();
+
+    let dot = dot(config, region, &[input.clone(), local_mask.clone()]).unwrap();
+
+    let assigned_output = enforce_equality(config, region, &[dot, output.clone()])?;
+
+    Ok(assigned_output)
+}
+
+fn one_hot<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    num_classes: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // assert values is flat
+    assert_eq!(values[0].dims().len(), 1);
+    // assert its a single elelemnt
+    assert_eq!(values[0].len(), 1);
+    let input = values[0].clone();
+    let is_assigned = !input.any_unknowns();
+
+    let output: ValTensor<F> = if is_assigned {
+        let int_evals = input.get_int_evals()?;
+        let res = tensor::ops::one_hot(&int_evals, num_classes, 1)?;
+        res.iter()
+            .map(|x| Value::known(i128_to_felt(*x)))
+            .collect::<Tensor<_>>()
+    } else {
+        Tensor::new(
+            Some(&vec![Value::<F>::unknown(); num_classes]),
+            &[num_classes],
+        )?
+    }
+    .into();
+
+    let assigned_input = region.assign(&config.inputs[0], &input)?;
+
+    // now assert all elems are 0 or 1
+    let assigned_output = region.assign(&config.inputs[1], &output)?;
+    if !region.is_dummy() {
+        for i in 0..assigned_output.len() {
+            let (x, y, z) = config.output.cartesian_coord(region.linear_coord() + i);
+            let selector = config.selectors.get(&(BaseOp::IsBoolean, x, y));
+            region.enable(selector, z)?;
         }
     }
+    region.increment(std::cmp::max(assigned_output.len(), assigned_input.len()));
+
+    let sum = sum(config, region, &[assigned_output.clone()])?;
+    // assert sum is 1
+    let mut unit = Tensor::from(vec![F::from(1)].into_iter());
+    unit.set_visibility(&crate::graph::Visibility::Fixed);
+    let unit: ValTensor<F> = unit.into();
+
+    enforce_equality(config, region, &[unit.clone(), sum])?;
+
+    let gathered = gather(
+        config,
+        region,
+        &[assigned_output.clone(), assigned_input.clone()],
+        0,
+    )?;
+
+    enforce_equality(config, region, &[unit, gathered])?;
+
+    Ok(assigned_output)
+}
+
+/// One hot accumulated layout
+pub fn one_hot_axis<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    num_classes: usize,
+    dim: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let input = values[0].clone();
+    let input_inner = input.get_inner_tensor()?;
+
+    let mut output_dims = values[0].dims().to_vec();
+    output_dims.insert(dim, num_classes);
+
+    let mut op_tensors = Tensor::new(None, input_inner.dims())?;
+
+    let inner_loop_function = |i: usize, region: &mut RegionCtx<'_, F>| -> ValTensor<F> {
+        let inp = input_inner[i].clone();
+        let tensor = Tensor::new(Some(&[inp.clone()]), &[1]).unwrap();
+
+        one_hot(config, region, &[tensor.into()], num_classes).unwrap()
+    };
+
+    if !region.is_dummy() {
+        op_tensors.iter_mut().enumerate().for_each(|(i, o)| {
+            *o = inner_loop_function(i, region);
+        });
+    } else {
+        region.dummy_loop(&mut op_tensors, inner_loop_function)?;
+    };
+
+    // Allocate memory for the output tensor
+    let cartesian_coord = output_dims
+        .iter()
+        .map(|x| 0..*x)
+        .multi_cartesian_product()
+        .collect::<Vec<_>>();
+
+    let mut output = Tensor::<ValType<F>>::new(None, &output_dims)?;
+
+    output = output.par_enum_map(|i, _| {
+        let coord = cartesian_coord[i].clone();
+        let mut op_idx = coord.clone();
+        let coord_at_dims = vec![coord[dim]];
+        op_idx.remove(dim);
+
+        let op_tensor = op_tensors.get(&op_idx);
+
+        let op_tensor = op_tensor.get_inner_tensor().map_err(|e| {
+            error!("{}", e);
+            halo2_proofs::plonk::Error::Synthesis
+        })?;
+
+        let one_hot_val = op_tensor.get(&coord_at_dims).clone();
+
+        Ok::<_, halo2_proofs::plonk::Error>(one_hot_val)
+    })?;
 
     Ok(output.into())
 }
 
-/// Sum accumulated layout
+/// Gather accumulated layout
+pub fn gather<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+    dim: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let (mut input, mut index_clone) = (values[0].clone(), values[1].clone());
+    index_clone.flatten();
+    if index_clone.is_singleton() {
+        index_clone.reshape(&[1])?;
+    }
+
+    let mut assigned_len = vec![];
+    if !input.all_prev_assigned() {
+        input = region.assign(&config.inputs[0], &input)?;
+        assigned_len.push(input.len());
+    }
+    if !index_clone.all_prev_assigned() {
+        index_clone = region.assign(&config.inputs[1], &index_clone)?;
+        assigned_len.push(index_clone.len());
+    }
+
+    if !assigned_len.is_empty() {
+        region.increment(*assigned_len.iter().max().unwrap());
+    }
+
+    // Calculate the output tensor size
+    let input_dims = input.dims();
+    let mut output_size = input_dims.to_vec();
+
+    output_size[dim] = index_clone.dims()[0];
+
+    // these will be assigned as constants
+    let mut indices = Tensor::from((0..input.dims()[dim] as u64).map(|x| F::from(x)));
+    indices.set_visibility(&crate::graph::Visibility::Fixed);
+    let indices = region.assign(&config.inputs[1], &indices.into())?;
+    region.increment(indices.len());
+
+    // Allocate memory for the output tensor
+    let cartesian_coord = output_size
+        .iter()
+        .map(|x| 0..*x)
+        .multi_cartesian_product()
+        .collect::<Vec<_>>();
+
+    let mut output: Tensor<ValType<F>> = Tensor::new(None, &output_size)?;
+
+    let inner_loop_function = |i: usize, region: &mut RegionCtx<'_, F>| -> ValType<F> {
+        let coord = cartesian_coord[i].clone();
+        let index_val = index_clone.get_single_elem(coord[dim]).unwrap();
+
+        let mut slice = coord.iter().map(|x| *x..*x + 1).collect::<Vec<_>>();
+        slice[dim] = 0..input_dims[dim];
+
+        let mut sliced_input = input.get_slice(&slice).unwrap();
+        sliced_input.flatten();
+
+        let res = select(
+            config,
+            region,
+            &[sliced_input, index_val.clone()],
+            indices.clone(),
+        )
+        .unwrap();
+
+        let res = res.get_inner_tensor().unwrap();
+
+        res[0].clone()
+    };
+
+    if !region.is_dummy() {
+        output.iter_mut().enumerate().for_each(|(i, o)| {
+            *o = inner_loop_function(i, region);
+        });
+    } else {
+        region.dummy_loop(&mut output, inner_loop_function)?;
+    };
+
+    // Reshape the output tensor
+    if index_clone.is_singleton() {
+        output_size.remove(dim);
+    }
+    output.reshape(&output_size);
+
+    Ok(output.into())
+}
+
+/// Gather accumulated layout
+pub fn gather_elements<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+    dim: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let (mut input, mut index) = (values[0].clone(), values[1].clone());
+
+    assert_eq!(input.dims().len(), index.dims().len());
+
+    if !input.all_prev_assigned() {
+        input = region.assign(&config.inputs[0], &input)?;
+    }
+    if !index.all_prev_assigned() {
+        index = region.assign(&config.inputs[1], &index)?;
+    }
+
+    region.increment(std::cmp::max(input.len(), index.len()));
+
+    // Calculate the output tensor size
+    let input_dim = input.dims()[dim];
+    let output_size = index.dims().to_vec();
+
+    // these will be assigned as constants
+    let mut indices = Tensor::from((0..input_dim as u64).map(|x| F::from(x)));
+    indices.set_visibility(&crate::graph::Visibility::Fixed);
+    let indices = region.assign(&config.inputs[1], &indices.into())?;
+    region.increment(indices.len());
+
+    // Allocate memory for the output tensor
+    let cartesian_coord = output_size
+        .iter()
+        .map(|x| 0..*x)
+        .multi_cartesian_product()
+        .collect::<Vec<_>>();
+
+    let mut output = Tensor::new(None, &output_size)?;
+
+    let inner_loop_function = |i: usize, region: &mut RegionCtx<'_, F>| -> ValType<F> {
+        let coord = cartesian_coord[i].clone();
+        let index_val = index.get_inner_tensor().unwrap().get(&coord);
+
+        let mut slice = coord.iter().map(|x| *x..*x + 1).collect::<Vec<_>>();
+        slice[dim] = 0..input_dim;
+
+        let mut sliced_input = input.get_slice(&slice).unwrap();
+        sliced_input.flatten();
+
+        let index_valtensor: ValTensor<F> = Tensor::from([index_val.clone()].into_iter()).into();
+
+        let res = select(
+            config,
+            region,
+            &[sliced_input, index_valtensor],
+            indices.clone(),
+        )
+        .unwrap();
+
+        let res = res.get_inner_tensor().unwrap();
+
+        res[0].clone()
+    };
+
+    if !region.is_dummy() {
+        output.iter_mut().enumerate().for_each(|(i, o)| {
+            *o = inner_loop_function(i, region);
+        });
+    } else {
+        region.dummy_loop(&mut output, inner_loop_function)?;
+    };
+
+    Ok(output.into())
+}
+
+/// Gather accumulated layout
+pub fn scatter_elements<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 3],
+    dim: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let (mut input, mut index, mut src) = (values[0].clone(), values[1].clone(), values[2].clone());
+
+    assert_eq!(input.dims().len(), index.dims().len());
+
+    let mut assigned_len = vec![];
+
+    if !input.all_prev_assigned() {
+        input = region.assign(&config.inputs[0], &input)?;
+        assigned_len.push(input.len());
+    }
+    if !index.all_prev_assigned() {
+        index = region.assign(&config.inputs[1], &index)?;
+        assigned_len.push(index.len());
+    }
+    if !src.all_prev_assigned() {
+        src = region.assign(&config.output, &src)?;
+        assigned_len.push(src.len());
+    }
+
+    if !assigned_len.is_empty() {
+        region.increment(*assigned_len.iter().max().unwrap());
+    }
+
+    // Calculate the output tensor size
+    let input_dim = input.dims()[dim];
+    let output_size = index.dims().to_vec();
+
+    // these will be assigned as constants
+    let mut indices = Tensor::from((0..input_dim as u64).map(|x| F::from(x)));
+    indices.set_visibility(&crate::graph::Visibility::Fixed);
+    let indices = region.assign(&config.inputs[1], &indices.into())?;
+    region.increment(indices.len());
+
+    // Allocate memory for the output tensor
+    let cartesian_coord = output_size
+        .iter()
+        .map(|x| 0..*x)
+        .multi_cartesian_product()
+        .collect::<Vec<_>>();
+
+    let mut unit = Tensor::from(vec![F::from(1)].into_iter());
+    unit.set_visibility(&crate::graph::Visibility::Fixed);
+    let unit: ValTensor<F> = unit.into();
+    region.assign(&config.inputs[1], &unit).unwrap();
+    region.increment(1);
+
+    let mut output = Tensor::new(None, &output_size)?;
+
+    let mut inner_loop_function = |i: usize, region: &mut RegionCtx<'_, F>| {
+        let coord = cartesian_coord[i].clone();
+        let index_val = index.get_inner_tensor().unwrap().get(&coord);
+
+        let src_val = src.get_inner_tensor().unwrap().get(&coord);
+        let src_valtensor: ValTensor<F> = Tensor::from([src_val.clone()].into_iter()).into();
+
+        let mut slice = coord.iter().map(|x| *x..*x + 1).collect::<Vec<_>>();
+        slice[dim] = 0..input_dim;
+
+        let mut sliced_input = input.get_slice(&slice).unwrap();
+        sliced_input.flatten();
+
+        let index_valtensor: ValTensor<F> = Tensor::from([index_val.clone()].into_iter()).into();
+
+        let mask = equals(config, region, &[index_valtensor, indices.clone()]).unwrap();
+
+        let one_minus_mask =
+            pairwise(config, region, &[unit.clone(), mask.clone()], BaseOp::Sub).unwrap();
+
+        let pairwise_prod = pairwise(config, region, &[src_valtensor, mask], BaseOp::Mult).unwrap();
+        let pairwise_prod_2 = pairwise(
+            config,
+            region,
+            &[sliced_input, one_minus_mask],
+            BaseOp::Mult,
+        )
+        .unwrap();
+
+        let res = pairwise(
+            config,
+            region,
+            &[pairwise_prod, pairwise_prod_2],
+            BaseOp::Add,
+        )
+        .unwrap();
+
+        let input_cartesian_coord = slice.into_iter().multi_cartesian_product();
+
+        let mutable_input_inner = input.get_inner_tensor_mut().unwrap();
+
+        for (i, r) in res.get_inner_tensor().unwrap().iter().enumerate() {
+            let coord = input_cartesian_coord.clone().nth(i).unwrap();
+            *mutable_input_inner.get_mut(&coord) = r.clone();
+        }
+    };
+
+    output.iter_mut().enumerate().for_each(|(i, o)| {
+        *o = inner_loop_function(i, region);
+    });
+
+    Ok(input)
+}
+
+/// sum accumulated layout
 pub fn sum<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 1],
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
+    region.flush();
+    // time this entire function run
+    let global_start = instant::Instant::now();
+
+    let mut values = values.clone();
+
+    // this section has been optimized to death, don't mess with it
+    let mut removal_indices = values[0].get_const_zero_indices()?;
+    removal_indices.par_sort_unstable();
+    removal_indices.dedup();
+
+    // is already sorted
+    values[0].remove_indices(&mut removal_indices, true)?;
+
+    let elapsed = global_start.elapsed();
+    trace!("filtering const zero indices took: {:?}", elapsed);
+
+    // if empty return a const
+    if values[0].is_empty() {
+        return Ok(Tensor::from([ValType::Constant(F::ZERO)].into_iter()).into());
+    }
+
+    let block_width = config.output.num_inner_cols();
+
     let assigned_len: usize;
     let input = {
+        let mut input = values[0].clone();
+        input.pad_to_zero_rem(block_width)?;
         let (res, len) =
-            region.assign_with_duplication(&config.inputs[1], &values[0], &config.check_mode)?;
+            region.assign_with_duplication(&config.inputs[1], &input, &config.check_mode, false)?;
         assigned_len = len;
         res.get_inner()?
     };
 
     // Now we can assign the dot product
-    let accumulated_sum = accumulated::sum(&input).expect("accum poly: sum op failed");
+    let accumulated_sum = accumulated::sum(&input, block_width).expect("accum poly: sum op failed");
 
     let (output, output_assigned_len) = region.assign_with_duplication(
         &config.output,
         &accumulated_sum.into(),
         &config.check_mode,
+        true,
     )?;
 
-    assert_eq!(assigned_len, output_assigned_len);
-
     // enable the selectors
-    (0..assigned_len).for_each(|i| {
-        let (x, y) = config.output.cartesian_coord(region.offset() + i);
-        // skip over duplicates at start of column
-        if y == 0 && i > 0 {
-            return;
-        }
-        let selector = if i == 0 {
-            config.selectors.get(&(BaseOp::Identity, x))
-        } else {
-            config.selectors.get(&(BaseOp::Sum, x))
-        };
+    if !region.is_dummy() {
+        for i in 0..output_assigned_len {
+            let (x, _, z) = config
+                .output
+                .cartesian_coord(region.linear_coord() + i * block_width);
+            // skip over duplicates at start of column
+            if z == 0 && i > 0 {
+                continue;
+            }
+            let selector = if i == 0 {
+                config.selectors.get(&(BaseOp::SumInit, x, 0))
+            } else {
+                config.selectors.get(&(BaseOp::Sum, x, 0))
+            };
 
-        region.enable(selector, y).unwrap();
-    });
+            region.enable(selector, z)?;
+        }
+    }
 
     let last_elem = output
         .get_slice(&[output.len() - 1..output.len()])
         .expect("accum poly: failed to fetch last elem");
 
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        let safe_dot = non_accum_sum(&input).map_err(|e| {
-            error!("{}", e);
-            halo2_proofs::plonk::Error::Synthesis
-        })?;
-
-        assert_eq!(
-            Into::<Tensor<i32>>::into(last_elem.get_inner()?),
-            Into::<Tensor<i32>>::into(safe_dot),
-        )
-    }
     region.increment(assigned_len);
 
     // last element is the result
     Ok(last_elem)
 }
 
-/// Sum accumulated layout
-pub fn sum_axes<F: PrimeField + TensorType + PartialOrd>(
+/// product accumulated layout
+pub fn prod<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    region.flush();
+    // time this entire function run
+    let global_start = instant::Instant::now();
+
+    // this section has been optimized to death, don't mess with it
+    let removal_indices = values[0].get_const_zero_indices()?;
+
+    let elapsed = global_start.elapsed();
+    trace!("finding const zero indices took: {:?}", elapsed);
+    // if empty return a const
+    if !removal_indices.is_empty() {
+        return Ok(Tensor::from([ValType::Constant(F::ZERO)].into_iter()).into());
+    }
+
+    let block_width = config.output.num_inner_cols();
+    let assigned_len: usize;
+    let input = {
+        let mut input = values[0].clone();
+        input.pad_to_zero_rem(block_width)?;
+        let (res, len) =
+            region.assign_with_duplication(&config.inputs[1], &input, &config.check_mode, false)?;
+        assigned_len = len;
+        res.get_inner()?
+    };
+
+    // Now we can assign the dot product
+    let accumulated_prod =
+        accumulated::prod(&input, block_width).expect("accum poly: prod op failed");
+
+    let (output, output_assigned_len) = region.assign_with_duplication(
+        &config.output,
+        &accumulated_prod.into(),
+        &config.check_mode,
+        true,
+    )?;
+
+    // enable the selectors
+    if !region.is_dummy() {
+        (0..output_assigned_len).for_each(|i| {
+            let (x, _, z) = config
+                .output
+                .cartesian_coord(region.linear_coord() + i * block_width);
+            // skip over duplicates at start of column
+            if z == 0 && i > 0 {
+                return;
+            }
+            let selector = if i == 0 {
+                config.selectors.get(&(BaseOp::CumProdInit, x, 0))
+            } else {
+                config.selectors.get(&(BaseOp::CumProd, x, 0))
+            };
+
+            region.enable(selector, z).unwrap();
+        });
+    }
+
+    let last_elem = output
+        .get_slice(&[output.len() - 1..output.len()])
+        .expect("accum poly: failed to fetch last elem");
+
+    region.increment(assigned_len);
+
+    // last element is the result
+    Ok(last_elem)
+}
+
+/// Axes wise op wrapper
+fn axes_wise_op<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 1],
     axes: &[usize],
+    // generic layout op
+    op: impl Fn(
+            &BaseConfig<F>,
+            &mut RegionCtx<F>,
+            &[ValTensor<F>; 1],
+        ) -> Result<ValTensor<F>, Box<dyn Error>>
+        + Send
+        + Sync,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     // calculate value of output
 
@@ -477,22 +1168,77 @@ pub fn sum_axes<F: PrimeField + TensorType + PartialOrd>(
         .multi_cartesian_product()
         .collect::<Vec<_>>();
 
-    for coord in cartesian_coord.iter() {
-        let mut sum_dims = vec![];
+    let inner_loop_function = |i: usize, region: &mut RegionCtx<'_, F>| -> ValType<F> {
+        let coord = cartesian_coord[i].clone();
+        let mut prod_dims = vec![];
         for (i, c) in coord.iter().enumerate() {
             if axes.contains(&i) {
-                sum_dims.push(0..a.dims()[i]);
+                prod_dims.push(0..a.dims()[i]);
             } else {
-                sum_dims.push(*c..*c + 1);
+                prod_dims.push(*c..*c + 1);
             }
         }
-        res.set(
-            coord,
-            sum(config, region, &[a.get_slice(&sum_dims)?])?.get_inner_tensor()?[0].clone(),
-        );
-    }
+        let values = a.get_slice(&prod_dims).unwrap();
+        let op = op(config, region, &[values]).unwrap();
+
+        op.get_inner_tensor().unwrap()[0].clone()
+    };
+
+    if !region.is_dummy() {
+        res.iter_mut().enumerate().for_each(|(i, o)| {
+            *o = inner_loop_function(i, region);
+        });
+    } else {
+        region.dummy_loop(&mut res, inner_loop_function)?;
+    };
 
     Ok(res.into())
+}
+
+/// Sum accumulated layout
+pub fn prod_axes<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    axes: &[usize],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // calculate value of output
+    axes_wise_op(config, region, values, axes, prod)
+}
+
+/// Sum accumulated layout
+pub fn sum_axes<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    axes: &[usize],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // calculate value of output
+    axes_wise_op(config, region, values, axes, sum)
+}
+
+/// argmax layout
+pub fn argmax_axes<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    dim: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // these will be assigned as constants
+    let mut indices = Tensor::from((0..values[0].dims()[dim] as u64).map(|x| F::from(x)));
+    indices.set_visibility(&crate::graph::Visibility::Fixed);
+    let indices = region.assign(&config.inputs[1], &indices.into())?;
+    region.increment(indices.len());
+
+    let argmax = move |config: &BaseConfig<F>,
+                       region: &mut RegionCtx<F>,
+                       values: &[ValTensor<F>; 1]|
+          -> Result<ValTensor<F>, Box<dyn Error>> {
+        argmax(config, region, values, indices.clone())
+    };
+
+    // calculate value of output
+    axes_wise_op(config, region, values, &[dim], argmax)
 }
 
 /// Max accumulated layout
@@ -504,45 +1250,31 @@ pub fn max_axes<F: PrimeField + TensorType + PartialOrd>(
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     // calculate value of output
 
-    let a = &values[0];
+    axes_wise_op(config, region, values, axes, max)
+}
 
-    if axes.is_empty() {
-        return Ok(a.clone());
-    }
+/// Argmin layout
+pub fn argmin_axes<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    dim: usize,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // calculate value of output
+    // these will be assigned as constants
+    let mut indices = Tensor::from((0..values[0].dims()[dim] as u64).map(|x| F::from(x)));
+    indices.set_visibility(&crate::graph::Visibility::Fixed);
+    let indices = region.assign(&config.inputs[1], &indices.into())?;
+    region.increment(indices.len());
 
-    let mut new_dims = vec![];
-    for i in 0..a.dims().len() {
-        if !axes.contains(&i) {
-            new_dims.push(a.dims()[i]);
-        } else {
-            new_dims.push(1);
-        }
-    }
+    let argmin = move |config: &BaseConfig<F>,
+                       region: &mut RegionCtx<F>,
+                       values: &[ValTensor<F>; 1]|
+          -> Result<ValTensor<F>, Box<dyn Error>> {
+        argmin(config, region, values, indices.clone())
+    };
 
-    let mut res = Tensor::new(None, &new_dims)?;
-
-    let cartesian_coord = new_dims
-        .iter()
-        .map(|x| 0..*x)
-        .multi_cartesian_product()
-        .collect::<Vec<_>>();
-
-    for coord in cartesian_coord.iter() {
-        let mut sum_dims = vec![];
-        for (i, c) in coord.iter().enumerate() {
-            if axes.contains(&i) {
-                sum_dims.push(0..a.dims()[i]);
-            } else {
-                sum_dims.push(*c..*c + 1);
-            }
-        }
-        res.set(
-            coord,
-            max(config, region, &[a.get_slice(&sum_dims)?])?.get_inner_tensor()?[0].clone(),
-        );
-    }
-
-    Ok(res.into())
+    axes_wise_op(config, region, values, &[dim], argmin)
 }
 
 /// Min accumulated layout
@@ -554,46 +1286,7 @@ pub fn min_axes<F: PrimeField + TensorType + PartialOrd>(
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     // calculate value of output
 
-    let a = &values[0];
-
-    if axes.is_empty() {
-        return Ok(a.clone());
-    }
-
-    let mut new_dims = vec![];
-    for i in 0..a.dims().len() {
-        if !axes.contains(&i) {
-            new_dims.push(a.dims()[i]);
-        } else {
-            new_dims.push(1);
-        }
-    }
-
-    let mut res = Tensor::new(None, &new_dims)?;
-
-    let cartesian_coord = new_dims
-        .iter()
-        .map(|x| 0..*x)
-        .multi_cartesian_product()
-        .collect::<Vec<_>>();
-
-    for coord in cartesian_coord.iter() {
-        let mut sum_dims = vec![];
-        for (i, c) in coord.iter().enumerate().take(a.dims().len()) {
-            if axes.contains(&i) {
-                sum_dims.push(0..a.dims()[i]);
-            } else {
-                sum_dims.push(*c..*c + 1);
-            }
-        }
-
-        res.set(
-            coord,
-            min(config, region, &[a.get_slice(&sum_dims)?])?.get_inner_tensor()?[0].clone(),
-        );
-    }
-
-    Ok(res.into())
+    axes_wise_op(config, region, values, axes, min)
 }
 
 /// Pairwise (elementwise) op layout
@@ -603,35 +1296,59 @@ pub fn pairwise<F: PrimeField + TensorType + PartialOrd>(
     values: &[ValTensor<F>; 2],
     op: BaseOp,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
-    if values.len() != config.inputs.len() {
+    // time to calculate the value of the output
+    let global_start = instant::Instant::now();
+
+    let (mut lhs, mut rhs) = (values[0].clone(), values[1].clone());
+
+    let broadcasted_shape = get_broadcasted_shape(lhs.dims(), rhs.dims())?;
+
+    lhs.expand(&broadcasted_shape)?;
+    rhs.expand(&broadcasted_shape)?;
+
+    // original values
+    let orig_lhs = lhs.clone();
+    let orig_rhs = rhs.clone();
+
+    // get indices of zeros
+    let first_zero_indices = lhs.get_const_zero_indices()?;
+    let second_zero_indices = rhs.get_const_zero_indices()?;
+    let mut removal_indices = match op {
+        BaseOp::Add | BaseOp::Mult => {
+            let mut removal_indices = first_zero_indices.clone();
+            removal_indices.extend(second_zero_indices.clone());
+            removal_indices
+        }
+        BaseOp::Sub => second_zero_indices.clone(),
+        _ => panic!(),
+    };
+    removal_indices.dedup();
+
+    let removal_indices: HashSet<&usize> = HashSet::from_iter(removal_indices.iter());
+    let removal_indices_ptr = &removal_indices;
+
+    if lhs.len() != rhs.len() {
         return Err(Box::new(CircuitError::DimMismatch(format!(
             "pairwise {} layout",
             op.as_str()
         ))));
     }
 
-    let (mut lhs, mut rhs) = (values[0].clone(), values[1].clone());
-
-    let broadcasted_shape = get_broadcasted_shape(lhs.dims(), rhs.dims())?;
-    lhs.expand(&broadcasted_shape)?;
-    rhs.expand(&broadcasted_shape)?;
-
-    if region.is_dummy() {
-        region.increment(lhs.len());
-        return Ok(lhs);
-    }
-
     let mut inputs = vec![];
-
     for (i, input) in [lhs.clone(), rhs.clone()].iter().enumerate() {
         let inp = {
-            let res = region.assign(&config.inputs[i], input)?;
+            let res =
+                region.assign_with_omissions(&config.inputs[i], input, removal_indices_ptr)?;
+
             res.get_inner()?
         };
+
         inputs.push(inp);
     }
 
     // Now we can assign the dot product
+    // time the calc
+    let start = instant::Instant::now();
     let op_result = match op {
         BaseOp::Add => add(&inputs),
         BaseOp::Sub => sub(&inputs),
@@ -642,22 +1359,230 @@ pub fn pairwise<F: PrimeField + TensorType + PartialOrd>(
         error!("{}", e);
         halo2_proofs::plonk::Error::Synthesis
     })?;
+    let elapsed = start.elapsed();
 
-    let mut output = region.assign(&config.output, &op_result.into())?;
+    let assigned_len = inputs[0].len() - removal_indices.len();
+    let mut output =
+        region.assign_with_omissions(&config.output, &op_result.into(), removal_indices_ptr)?;
+    trace!("pairwise {} calc took {:?}", op.as_str(), elapsed);
 
     // Enable the selectors
-    (0..inputs[0].len()).for_each(|i| {
-        let (x, y) = config.inputs[0].cartesian_coord(region.offset() + i);
-        let selector = config.selectors.get(&(op.clone(), x));
+    if !region.is_dummy() {
+        (0..assigned_len).for_each(|i| {
+            let (x, y, z) = config.inputs[0].cartesian_coord(region.linear_coord() + i);
+            let selector = config.selectors.get(&(op.clone(), x, y));
 
-        region.enable(selector, y).unwrap();
-    });
+            region.enable(selector, z).unwrap();
+        });
+    }
+    region.increment(assigned_len);
 
-    region.increment(output.len());
+    let a_tensor = orig_lhs.get_inner_tensor()?;
+    let b_tensor = orig_rhs.get_inner_tensor()?;
 
-    output.reshape(lhs.dims())?;
+    let first_zero_indices: HashSet<&usize> = HashSet::from_iter(first_zero_indices.iter());
+    let second_zero_indices: HashSet<&usize> = HashSet::from_iter(second_zero_indices.iter());
+
+    trace!("setting up indices took {:?}", start.elapsed());
+
+    // infill the zero indices with the correct values from values[0] or values[1]
+    if !removal_indices_ptr.is_empty() {
+        output
+            .get_inner_tensor_mut()?
+            .par_enum_map_mut_filtered(removal_indices_ptr, |i| {
+                let val = match op {
+                    BaseOp::Add => {
+                        let a_is_null = first_zero_indices.contains(&i);
+                        let b_is_null = second_zero_indices.contains(&i);
+
+                        if a_is_null && b_is_null {
+                            ValType::Constant(F::ZERO)
+                        } else if a_is_null {
+                            b_tensor[i].clone()
+                        } else {
+                            a_tensor[i].clone()
+                        }
+                    }
+                    BaseOp::Sub => {
+                        let a_is_null = first_zero_indices.contains(&i);
+                        // by default b is null in this case for sub
+                        if a_is_null {
+                            ValType::Constant(F::ZERO)
+                        } else {
+                            a_tensor[i].clone()
+                        }
+                    }
+                    BaseOp::Mult => ValType::Constant(F::ZERO),
+                    _ => panic!(),
+                };
+                Ok::<_, TensorError>(val)
+            })?;
+    }
+
+    output.reshape(&broadcasted_shape)?;
+
+    let end = global_start.elapsed();
+    trace!(
+        "pairwise {} layout took {:?}, row: {}",
+        op.as_str(),
+        end,
+        region.row()
+    );
 
     Ok(output)
+}
+
+///
+pub fn greater<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let (mut lhs, mut rhs) = (values[0].clone(), values[1].clone());
+
+    let broadcasted_shape = get_broadcasted_shape(lhs.dims(), rhs.dims())?;
+
+    lhs.expand(&broadcasted_shape)?;
+    rhs.expand(&broadcasted_shape)?;
+
+    let diff = pairwise(config, region, &[lhs, rhs], BaseOp::Sub)?;
+
+    nonlinearity(
+        config,
+        region,
+        &[diff],
+        &LookupOp::GreaterThan { a: utils::F32(0.) },
+    )
+}
+
+///
+pub fn greater_equal<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let (mut lhs, mut rhs) = (values[0].clone(), values[1].clone());
+
+    let broadcasted_shape = get_broadcasted_shape(lhs.dims(), rhs.dims())?;
+
+    lhs.expand(&broadcasted_shape)?;
+    rhs.expand(&broadcasted_shape)?;
+
+    let diff = pairwise(config, region, &[lhs, rhs], BaseOp::Sub)?;
+
+    nonlinearity(
+        config,
+        region,
+        &[diff],
+        &LookupOp::GreaterThanEqual { a: utils::F32(0.) },
+    )
+}
+
+///
+pub fn less<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // just flip the order and use greater
+    greater(config, region, &[values[1].clone(), values[0].clone()])
+}
+
+///
+pub fn less_equal<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // just flip the order and use greater
+    greater_equal(config, region, &[values[1].clone(), values[0].clone()])
+}
+
+/// And boolean operation
+pub fn and<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let res = pairwise(config, region, values, BaseOp::Mult)?;
+
+    Ok(res)
+}
+
+/// Or boolean operation
+pub fn or<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let a = values[0].clone();
+    let b = values[1].clone();
+
+    let iff_values = &[a.clone(), a, b];
+
+    let res = iff(config, region, iff_values)?;
+
+    Ok(res)
+}
+
+/// Equality boolean operation
+pub fn equals<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let diff = pairwise(config, region, values, BaseOp::Sub)?;
+
+    let res = nonlinearity(config, region, &[diff], &LookupOp::KroneckerDelta)?;
+
+    Ok(res)
+}
+
+/// Xor boolean operation
+pub fn xor<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 2],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let lhs = values[0].clone();
+    let rhs = values[1].clone();
+
+    let lhs_not = not(config, region, &[lhs.clone()])?;
+    let rhs_not = not(config, region, &[rhs.clone()])?;
+
+    let lhs_and_rhs_not = and(config, region, &[lhs, rhs_not.clone()])?;
+    let lhs_not_and_rhs = and(config, region, &[rhs, lhs_not])?;
+
+    // we can safely use add and not OR here because we know that lhs_and_rhs_not and lhs_not_and_rhs are =1 at different incices
+    let res: ValTensor<F> = pairwise(
+        config,
+        region,
+        &[lhs_and_rhs_not, lhs_not_and_rhs],
+        BaseOp::Add,
+    )?;
+
+    Ok(res)
+}
+
+/// Not boolean operation
+pub fn not<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let mask = values[0].clone();
+
+    let unit: ValTensor<F> =
+        Tensor::from(vec![region.assign_constant(&config.inputs[0], F::from(1))?].into_iter())
+            .into();
+
+    // to leverage sparsity we don't assign this guy
+    let nil: ValTensor<F> = Tensor::from(vec![ValType::Constant(F::from(0))].into_iter()).into();
+    region.next();
+
+    let res = iff(config, region, &[mask, nil, unit])?;
+
+    Ok(res)
 }
 
 /// Iff
@@ -667,36 +1592,35 @@ pub fn iff<F: PrimeField + TensorType + PartialOrd>(
     values: &[ValTensor<F>; 3],
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     // if mask > 0 then output a else output b
-    let (mask, b, a) = (&values[0], &values[1], &values[2]);
+    let (mask, a, b) = (&values[0], &values[1], &values[2]);
 
     let unit: ValTensor<F> =
-        Tensor::from(vec![region.assign_constant(&config.inputs[1], F::from(1))?].into_iter())
+        Tensor::from(vec![region.assign_constant(&config.inputs[0], F::from(1))?].into_iter())
             .into();
-    region.next();
 
     // make sure mask is boolean
-
     let assigned_mask = region.assign(&config.inputs[1], mask)?;
 
     // Enable the selectors
-    (0..assigned_mask.len()).for_each(|i| {
-        let (x, y) = config.inputs[1].cartesian_coord(region.offset() + i);
-        let selector = config.selectors.get(&(BaseOp::IsBoolean, x));
-
-        region.enable(selector, y).unwrap();
-    });
+    if !region.is_dummy() {
+        (0..assigned_mask.len()).for_each(|i| {
+            let (x, y, z) = config.inputs[1].cartesian_coord(region.linear_coord() + i);
+            let selector = config.selectors.get(&(BaseOp::IsBoolean, x, y));
+            region.enable(selector, z).unwrap();
+        });
+    }
 
     region.increment(assigned_mask.len());
 
     let one_minus_mask = pairwise(config, region, &[unit, assigned_mask.clone()], BaseOp::Sub)?;
 
     let masked_a = pairwise(config, region, &[a.clone(), assigned_mask], BaseOp::Mult)?;
+
     let masked_b = pairwise(config, region, &[b.clone(), one_minus_mask], BaseOp::Mult)?;
 
-    let output = pairwise(config, region, &[masked_a, masked_b], BaseOp::Add)?;
+    let res = pairwise(config, region, &[masked_a, masked_b], BaseOp::Add)?;
 
-    // Now we can assign the matmul op
-    Ok(output)
+    Ok(res)
 }
 
 /// Negation operation accumulated layout
@@ -707,6 +1631,7 @@ pub fn neg<F: PrimeField + TensorType + PartialOrd>(
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     let input = {
         let res = region.assign(&config.inputs[1], &values[0])?;
+
         res.get_inner()?
     };
 
@@ -715,12 +1640,14 @@ pub fn neg<F: PrimeField + TensorType + PartialOrd>(
     let output = region.assign(&config.output, &neg.into())?;
 
     // Enable the selectors
-    (0..values[0].len()).for_each(|i| {
-        let (x, y) = config.inputs[1].cartesian_coord(region.offset() + i);
-        let selector = config.selectors.get(&(BaseOp::Neg, x));
+    if !region.is_dummy() {
+        (0..values[0].len()).for_each(|i| {
+            let (x, y, z) = config.inputs[1].cartesian_coord(region.linear_coord() + i);
+            let selector = config.selectors.get(&(BaseOp::Neg, x, y));
 
-        region.enable(selector, y).unwrap();
-    });
+            region.enable(selector, z).unwrap();
+        });
+    }
 
     region.increment(output.len());
 
@@ -732,7 +1659,7 @@ pub fn sumpool<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>],
-    padding: (usize, usize),
+    padding: [(usize, usize); 2],
     stride: (usize, usize),
     kernel_shape: (usize, usize),
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
@@ -745,7 +1672,7 @@ pub fn sumpool<F: PrimeField + TensorType + PartialOrd>(
     let mut kernel = Tensor::from(0..kernel_shape.0 * kernel_shape.1).map(|_| unit.clone());
     kernel.reshape(&[1, 1, kernel_shape.0, kernel_shape.1]);
 
-    let cartesian_coord = vec![(0..batch_size), (0..image_channels)]
+    let cartesian_coord = [(0..batch_size), (0..image_channels)]
         .iter()
         .cloned()
         .multi_cartesian_product()
@@ -773,27 +1700,6 @@ pub fn sumpool<F: PrimeField + TensorType + PartialOrd>(
     });
     last_elem.reshape(&[&[batch_size, image_channels], shape].concat())?;
 
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(last_elem.clone().get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let safe_sumpool =
-                non_accum_sumpool(&values[0].get_inner()?, padding, stride, kernel_shape).map_err(
-                    |e| {
-                        error!("{}", e);
-                        halo2_proofs::plonk::Error::Synthesis
-                    },
-                )?;
-
-            assert_eq!(
-                Into::<Tensor<i32>>::into(last_elem.clone().get_inner()?),
-                Into::<Tensor<i32>>::into(safe_sumpool),
-            )
-        }
-    }
     Ok(last_elem)
 }
 
@@ -802,7 +1708,7 @@ pub fn max_pool2d<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 1],
-    padding: (usize, usize),
+    padding: [(usize, usize); 2],
     stride: (usize, usize),
     pool_dims: (usize, usize),
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
@@ -819,13 +1725,13 @@ pub fn max_pool2d<F: PrimeField + TensorType + PartialOrd>(
     let mut padded_image = image.clone();
     padded_image.pad(padding)?;
 
-    let horz_slides = (image_height + 2 * padding.0 - pool_dims.0) / stride.0 + 1;
-    let vert_slides = (image_width + 2 * padding.1 - pool_dims.1) / stride.1 + 1;
+    let vert_slides = (image_height + padding[0].0 + padding[1].0 - pool_dims.0) / stride.0 + 1;
+    let horz_slides = (image_width + padding[0].1 + padding[1].1 - pool_dims.1) / stride.1 + 1;
 
     let mut output: Tensor<ValType<F>> =
         Tensor::new(None, &[batch, input_channels, horz_slides, vert_slides])?;
 
-    let cartesian_coord = vec![
+    let cartesian_coord = [
         (0..batch),
         (0..input_channels),
         (0..vert_slides),
@@ -855,23 +1761,6 @@ pub fn max_pool2d<F: PrimeField + TensorType + PartialOrd>(
 
     let res: ValTensor<F> = output.into();
 
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(res.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let raw_values = Into::<Tensor<i32>>::into(image.get_inner()?);
-            let safe_max_pool = non_accum_max_pool2d(&raw_values, &padding, &stride, &pool_dims)?;
-
-            assert_eq!(
-                Into::<Tensor<i32>>::into(res.get_inner()?),
-                Into::<Tensor<i32>>::into(safe_max_pool),
-            )
-        }
-    }
-
     Ok(res)
 }
 
@@ -880,7 +1769,7 @@ pub fn deconv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std:
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     inputs: &[ValTensor<F>],
-    padding: (usize, usize),
+    padding: [(usize, usize); 2],
     output_padding: (usize, usize),
     stride: (usize, usize),
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
@@ -908,36 +1797,19 @@ pub fn deconv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std:
 
     let (kernel_height, kernel_width) = (kernel.dims()[2], kernel.dims()[3]);
 
-    let null_val = region.assign_constant(&config.inputs[1], F::from(0))?;
-    region.next();
+    let null_val = ValType::Constant(F::ZERO);
+    // region.assign_constant(&config.inputs[1], F::from(0))?;
+    // region.next();
 
     let mut expanded_image = image.clone();
     expanded_image.intercalate_values(null_val.clone(), stride.0, 2)?;
     expanded_image.intercalate_values(null_val, stride.1, 3)?;
-    expanded_image.pad((kernel_height - 1, kernel_width - 1))?;
+    expanded_image.pad([(kernel_height - 1, kernel_width - 1); 2])?;
 
     // flip order
     let channel_coord = (0..kernel.dims()[0])
         .cartesian_product(0..kernel.dims()[1])
         .collect::<Vec<_>>();
-
-    let mut inverted_kernels = vec![];
-
-    for (i, j) in channel_coord {
-        let channel = kernel.get_slice(&[i..i + 1, j..j + 1])?;
-        let mut channel = Tensor::from(channel.get_inner_tensor()?.into_iter().rev());
-        channel.reshape(&[kernel.dims()[2], kernel.dims()[3]]);
-        inverted_kernels.push(channel);
-    }
-
-    let mut deconv_kernel =
-        Tensor::new(Some(&inverted_kernels), &[inverted_kernels.len()])?.combine()?;
-    deconv_kernel.reshape(&[
-        kernel.dims()[1],
-        kernel.dims()[0],
-        kernel.dims()[2],
-        kernel.dims()[3],
-    ]);
 
     let slice_coord = expanded_image
         .dims()
@@ -945,9 +1817,9 @@ pub fn deconv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std:
         .enumerate()
         .map(|(i, d)| {
             if i == 2 {
-                padding.0..d - padding.0 + output_padding.0
+                padding[0].0..d - padding[1].0 + output_padding.0
             } else if i == 3 {
-                padding.1..d - padding.1 + output_padding.1
+                padding[0].1..d - padding[1].1 + output_padding.1
             } else {
                 0..*d
             }
@@ -955,6 +1827,29 @@ pub fn deconv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std:
         .collect::<Vec<_>>();
 
     let sliced_expanded_image = expanded_image.get_slice(&slice_coord)?;
+
+    let mut inverted_kernels = vec![];
+
+    for (i, j) in channel_coord {
+        let channel = kernel.get_slice(&[i..i + 1, j..j + 1])?;
+        let mut channel = Tensor::from(channel.get_inner_tensor()?.clone().into_iter().rev());
+        channel.reshape(&[kernel.dims()[2], kernel.dims()[3]]);
+        inverted_kernels.push(channel);
+    }
+
+    let mut deconv_kernel =
+        Tensor::new(Some(&inverted_kernels), &[inverted_kernels.len()])?.combine()?;
+    deconv_kernel.reshape(kernel.dims());
+
+    // tensorflow formatting patch
+    if kernel.dims()[0] == sliced_expanded_image.dims()[1] {
+        deconv_kernel.reshape(&[
+            kernel.dims()[1],
+            kernel.dims()[0],
+            kernel.dims()[2],
+            kernel.dims()[3],
+        ]);
+    }
 
     let conv_input = if has_bias {
         vec![
@@ -966,35 +1861,7 @@ pub fn deconv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std:
         vec![sliced_expanded_image, deconv_kernel.clone().into()]
     };
 
-    let output = conv(config, region, &conv_input, (0, 0), (1, 1))?;
-
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(output.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let safe_conv = non_accum_deconv(
-                &inputs
-                    .iter()
-                    .map(|x| x.get_inner().unwrap())
-                    .collect::<Vec<Tensor<_>>>(),
-                padding,
-                output_padding,
-                stride,
-            )
-            .map_err(|e| {
-                error!("{}", e);
-                halo2_proofs::plonk::Error::Synthesis
-            })?;
-
-            assert_eq!(
-                Into::<Tensor<i32>>::into(output.get_inner()?),
-                Into::<Tensor<i32>>::into(safe_conv),
-            )
-        }
-    }
+    let output = conv(config, region, &conv_input, [(0, 0); 2], (1, 1))?;
 
     Ok(output)
 }
@@ -1004,19 +1871,52 @@ pub fn conv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std::m
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>],
-    padding: (usize, usize),
+    padding: [(usize, usize); 2],
     stride: (usize, usize),
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     let has_bias = values.len() == 3;
-    let (mut image, kernel) = (values[0].clone(), values[1].clone());
-    let og_dims = image.dims().to_vec();
+    let (mut image, mut kernel) = (values[0].clone(), values[1].clone());
 
+    // we specifically want to use the same kernel and image for all the convolutions and need to enforce this by assigning them
+    // 1. assign the kernel
+    let mut assigned_len = vec![];
+
+    if !kernel.all_prev_assigned() {
+        kernel = region.assign(&config.inputs[0], &kernel)?;
+        assigned_len.push(kernel.len());
+    }
+    // 2. assign the image
+    if !image.all_prev_assigned() {
+        image = region.assign(&config.inputs[1], &image)?;
+        assigned_len.push(image.len());
+    }
+
+    if !assigned_len.is_empty() {
+        region.increment(*assigned_len.iter().max().unwrap());
+    }
+
+    let og_image_dims = image.dims().to_vec();
+    let og_kernel_dims = kernel.dims().to_vec();
     // ensure inputs are 4D tensors
-    if og_dims.len() == 3 {
-        // adds a dummy batch dimension
-        let mut new_dims = vec![1];
-        new_dims.extend_from_slice(image.dims());
+    if og_image_dims.len() == 3 {
+        // adds a dummy image_channels dimension
+        let mut new_dims = image.dims().to_vec();
+        // insert 1 at the input_channels pos
+        if og_kernel_dims.len() == 3 {
+            new_dims.insert(1, 1);
+        } else {
+            new_dims.insert(0, 1);
+        }
         image.reshape(&new_dims)?;
+    }
+
+    // ensure kernel is 4D tensor
+    if og_kernel_dims.len() == 3 && og_image_dims.len() == 3 {
+        // adds a dummy image_channels dimension
+        let mut new_dims = kernel.dims().to_vec();
+        // insert 1 at the input_channels pos
+        new_dims.insert(1, 1);
+        kernel.reshape(&new_dims)?;
     }
 
     // if not 4D then error
@@ -1043,8 +1943,8 @@ pub fn conv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std::m
 
     let (image_height, image_width) = (image_dims[2], image_dims[3]);
 
-    let vert_slides = (image_height + 2 * padding.0 - kernel_height) / stride.0 + 1;
-    let horz_slides = (image_width + 2 * padding.1 - kernel_width) / stride.1 + 1;
+    let vert_slides = (image_height + padding[0].0 + padding[1].0 - kernel_height) / stride.0 + 1;
+    let horz_slides = (image_width + padding[0].1 + padding[1].1 - kernel_width) / stride.1 + 1;
 
     let num_groups = input_channels / kernel_dims[1];
     let input_channels_per_group = input_channels / num_groups;
@@ -1060,9 +1960,9 @@ pub fn conv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std::m
     let num_outputs =
         batch_size * num_groups * output_channels_per_group * vert_slides * horz_slides;
 
-    let mut output = Tensor::new(None, &[num_outputs])?;
+    let mut output: Tensor<ValType<F>> = Tensor::new(None, &[num_outputs])?;
 
-    let cartesian_coord = vec![
+    let cartesian_coord = [
         (0..batch_size),
         (0..num_groups),
         (0..output_channels_per_group),
@@ -1074,29 +1974,7 @@ pub fn conv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std::m
     .multi_cartesian_product()
     .collect::<Vec<_>>();
 
-    let reshape_output = |output: &mut Tensor<ValType<F>>| {
-        // remove dummy batch dimension if we added one
-        if og_dims.len() == 3 {
-            output.reshape(&[output_channels, vert_slides, horz_slides]);
-        } else {
-            output.reshape(&[batch_size, output_channels, vert_slides, horz_slides]);
-        }
-    };
-
-    if region.is_dummy() {
-        // calculate the total number of constraints we added
-        let mut total_len = output.len() * kernel_height * kernel_width * input_channels_per_group;
-        if has_bias {
-            total_len += output.len();
-        }
-        // calculate the number of constraints that overflowed into a subsequent column
-        let overflowed_len = overflowed_len(region.offset(), total_len, config.output.col_size());
-        region.increment(overflowed_len);
-        reshape_output(&mut output);
-        return Ok(output.into());
-    }
-
-    output.iter_mut().enumerate().for_each(|(idx, o)| {
+    let inner_loop_function = |idx: usize, region: &mut RegionCtx<F>| -> ValType<F> {
         let cartesian_coord_per_group = &cartesian_coord[idx];
         let (batch, group, i, j, k) = (
             cartesian_coord_per_group[0],
@@ -1131,51 +2009,41 @@ pub fn conv<F: PrimeField + TensorType + PartialOrd + std::marker::Send + std::m
         local_kernel.flatten();
 
         // this is dot product notation in einsum format
-        let mut res = einsum(config, region, &mut [local_image, local_kernel], "i,i->").unwrap();
+        let mut res = einsum(config, region, &[local_image, local_kernel], "i,i->").unwrap();
 
         if has_bias {
-            let bias = values[2]
-                .get_inner_tensor()
-                .unwrap()
-                .get_slice(&[start_kernel_index..end_kernel_index])
-                .unwrap();
-            res = pairwise(config, region, &[res, bias.into()], BaseOp::Add).unwrap()
+            let bias = values[2].get_single_elem(start_kernel_index).unwrap();
+            res = pairwise(config, region, &[res, bias], BaseOp::Add).unwrap()
         }
+        region.flush();
 
-        *o = res.get_inner_tensor().unwrap()[0].clone();
-    });
+        res.get_inner_tensor().unwrap()[0].clone()
+    };
+
+    region.flush();
+    if !region.is_dummy() {
+        output.iter_mut().enumerate().for_each(|(idx, o)| {
+            *o = inner_loop_function(idx, region);
+        });
+    } else {
+        region.dummy_loop(&mut output, inner_loop_function)?;
+    }
+
+    let reshape_output = |output: &mut Tensor<ValType<F>>| {
+        // remove dummy batch dimension if we added one
+        if og_image_dims.len() == 3 && vert_slides == 1 {
+            output.reshape(&[batch_size, output_channels, horz_slides]);
+        } else if og_image_dims.len() == 3 {
+            output.reshape(&[output_channels, vert_slides, horz_slides]);
+        } else {
+            output.reshape(&[batch_size, output_channels, vert_slides, horz_slides]);
+        }
+    };
 
     // remove dummy batch dimension if we added one
     reshape_output(&mut output);
 
     let output: ValTensor<_> = output.into();
-
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(output.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let safe_conv = non_accum_conv(
-                &values
-                    .iter()
-                    .map(|x| x.get_inner().unwrap())
-                    .collect::<Vec<Tensor<_>>>(),
-                padding,
-                stride,
-            )
-            .map_err(|e| {
-                error!("{}", e);
-                halo2_proofs::plonk::Error::Synthesis
-            })?;
-
-            assert_eq!(
-                Into::<Tensor<i32>>::into(output.get_inner()?),
-                Into::<Tensor<i32>>::into(safe_conv),
-            )
-        }
-    }
 
     Ok(output)
 }
@@ -1191,25 +2059,6 @@ pub fn pow<F: PrimeField + TensorType + PartialOrd>(
 
     for _ in 1..exponent {
         t = pairwise(config, region, &[t, values[0].clone()], BaseOp::Mult)?;
-    }
-
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(t.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let safe_pow = values[0].get_inner().unwrap().pow(exponent).map_err(|e| {
-                error!("{}", e);
-                halo2_proofs::plonk::Error::Synthesis
-            })?;
-
-            assert_eq!(
-                Into::<Tensor<i32>>::into(t.get_inner()?),
-                Into::<Tensor<i32>>::into(safe_pow),
-            )
-        }
     }
 
     Ok(t)
@@ -1228,15 +2077,10 @@ pub fn rescale<F: PrimeField + TensorType + PartialOrd>(
             rescaled_inputs.push(ri.clone());
             continue;
         }
-        let scaled_input = nonlinearity(
-            config,
-            region,
-            &[ri.clone()],
-            &LookupOp::Div {
-                denom: (scales[i].1 as f32).into(),
-            },
-        )?;
 
+        let multiplier: ValTensor<F> =
+            Tensor::from(vec![ValType::Constant(F::from(scales[i].1 as u64))].into_iter()).into();
+        let scaled_input = pairwise(config, region, &[ri.clone(), multiplier], BaseOp::Mult)?;
         rescaled_inputs.push(scaled_input);
     }
 
@@ -1275,26 +2119,6 @@ pub fn pack<F: PrimeField + TensorType + PartialOrd>(
     )?;
 
     let res = sum(config, region, &[base_prod])?;
-
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(res.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let safe_pow = non_accum_pack(&values[0].get_inner()?, Value::known(base_t), scale)
-                .map_err(|e| {
-                    error!("{}", e);
-                    halo2_proofs::plonk::Error::Synthesis
-                })?;
-
-            assert_eq!(
-                Into::<Tensor<i32>>::into(res.get_inner()?),
-                Into::<Tensor<i32>>::into(safe_pow),
-            )
-        }
-    }
 
     Ok(res)
 }
@@ -1356,9 +2180,11 @@ pub fn concat<F: PrimeField + TensorType + PartialOrd>(
     values: &[ValTensor<F>],
     axis: &usize,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
-    let collected_inner: Result<Vec<Tensor<_>>, _> =
+    let collected_inner: Result<Vec<&Tensor<_>>, _> =
         values.iter().map(|e| e.get_inner_tensor()).collect();
-    Ok(tensor::ops::concat(&collected_inner?, *axis)?.into())
+    let collected_inner = collected_inner?;
+
+    Ok(tensor::ops::concat(&collected_inner, *axis)?.into())
 }
 
 /// Identity constraint. Usually used to constrain an instance column to an advice so the returned cells / values can be operated upon.
@@ -1367,7 +2193,31 @@ pub fn identity<F: PrimeField + TensorType + PartialOrd>(
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 1],
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
-    let output = region.assign(&config.output, &values[0])?;
+    let mut output = values[0].clone();
+    if !output.all_prev_assigned() {
+        output = region.assign(&config.output, &values[0])?;
+        region.increment(output.len());
+    }
+
+    Ok(output)
+}
+
+/// Boolean identity constraint. Usually used to constrain an instance column to an advice so the returned cells / values can be operated upon.
+pub fn boolean_identity<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let output = region.assign(&config.inputs[1], &values[0])?;
+    // Enable the selectors
+    if !region.is_dummy() {
+        (0..output.len()).for_each(|j| {
+            let (x, y, z) = config.inputs[1].cartesian_coord(region.linear_coord() + j);
+            let selector = config.selectors.get(&(BaseOp::IsBoolean, x, y));
+
+            region.enable(selector, z).unwrap();
+        });
+    }
     region.increment(output.len());
 
     Ok(output)
@@ -1384,79 +2234,113 @@ pub fn downsample<F: PrimeField + TensorType + PartialOrd>(
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     let input = region.assign(&config.inputs[0], &values[0])?;
     let processed_output =
-        tensor::ops::downsample(&input.get_inner_tensor()?, *axis, *stride, *modulo)?;
+        tensor::ops::downsample(input.get_inner_tensor()?, *axis, *stride, *modulo)?;
     let output = region.assign(&config.output, &processed_output.into())?;
-    region.increment(input.len());
+    region.increment(std::cmp::max(input.len(), output.len()));
     Ok(output)
 }
 
-/// Layout for range check.
-pub fn range_check<F: PrimeField + TensorType + PartialOrd>(
+/// layout for enforcing two sets of cells to be equal
+pub fn enforce_equality<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 2],
-    tol: i32,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // assert of same len
+
     // assigns the instance to the advice.
-    region.assign(&config.inputs[1], &values[0])?;
+    let input = region.assign(&config.inputs[1], &values[0])?;
     let output = region.assign(&config.output, &values[1])?;
 
-    (0..values[0].len()).for_each(|i| {
-        let (x, y) = config.inputs[1].cartesian_coord(region.offset() + i);
-        let selector = config.selectors.get(&(BaseOp::Range { tol }, x));
-
-        region.enable(selector, y).unwrap();
-    });
+    if !region.is_dummy() {
+        region.constrain_equal(&input, &output)?;
+    }
 
     region.increment(output.len());
 
     Ok(output)
 }
 
-/// Layout for nonlinearity check.
+/// layout for nonlinearity check.
 pub fn nonlinearity<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 1],
     nl: &LookupOp,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
-    let x = &values[0];
+    // time the entire operation
+    let timer = instant::Instant::now();
 
-    if region.is_dummy() {
-        region.increment(x.len());
-        return Ok(x.clone());
-    }
+    let x = values[0].clone();
 
-    let w = region.assign(&config.lookup_input, x)?;
+    let removal_indices = values[0].get_const_indices()?;
+    let removal_indices: HashSet<&usize> = HashSet::from_iter(removal_indices.iter());
+    let removal_indices_ptr = &removal_indices;
 
-    // extract integer_valuations
-    let felt_evals: Tensor<F> = w.get_felt_evals().map_err(|e| {
-        error!("{}", e);
-        halo2_proofs::plonk::Error::Synthesis
+    let w = region.assign_with_omissions(&config.lookup_input, &x, removal_indices_ptr)?;
+
+    let output = w.get_inner_tensor()?.par_enum_map(|i, e| {
+        Ok::<_, TensorError>(if let Some(f) = e.get_felt_eval() {
+            if !removal_indices.contains(&i) {
+                Value::known(Op::<F>::f(nl, &[Tensor::from(vec![f].into_iter())])?.output[0]).into()
+            } else {
+                ValType::Constant(Op::<F>::f(nl, &[Tensor::from(vec![f].into_iter())])?.output[0])
+            }
+        } else {
+            Value::<F>::unknown().into()
+        })
     })?;
 
-    // for key generation integer_evals will be empty and we need to return a set of unassigned values
-    let output: Tensor<Value<F>> = match felt_evals.len() {
-        // if empty return an unknown val
-        0 => Tensor::from((0..x.dims().iter().product::<usize>()).map(|_| Value::unknown())),
-        // if not empty apply the nonlinearity !
-        _ => {
-            let x = Op::<F>::f(nl, &[felt_evals])?;
-            x.output.map(|elem| Value::known(elem))
-        }
-    };
+    let assigned_len = x.len() - removal_indices.len();
+    let mut output =
+        region.assign_with_omissions(&config.lookup_output, &output.into(), removal_indices_ptr)?;
 
-    let mut output = region.assign(&config.lookup_output, &output.into())?;
+    let is_dummy = region.is_dummy();
 
-    (0..x.len()).for_each(|i| {
-        let (x, y) = config.lookup_input.cartesian_coord(region.offset() + i);
-        let selector = config.lookup_selectors.get(&(nl.clone(), x));
-        region.enable(selector, y).unwrap();
-    });
+    let table_index: ValTensor<F> = w
+        .get_inner_tensor()?
+        .par_enum_map(|i, e| {
+            Ok::<_, TensorError>(if let Some(f) = e.get_felt_eval() {
+                let col_idx = if !is_dummy {
+                    let table = config.tables.get(nl).unwrap();
+                    table.get_col_index(f)
+                } else {
+                    F::ZERO
+                };
+                if !removal_indices.contains(&i) {
+                    Value::known(col_idx).into()
+                } else {
+                    ValType::Constant(col_idx)
+                }
+            } else {
+                Value::<F>::unknown().into()
+            })
+        })?
+        .into();
+
+    region.assign_with_omissions(&config.lookup_index, &table_index, removal_indices_ptr)?;
+
+    if !is_dummy {
+        (0..assigned_len).for_each(|i| {
+            let (x, y, z) = config
+                .lookup_input
+                .cartesian_coord(region.linear_coord() + i);
+            let selector = config.lookup_selectors.get(&(nl.clone(), x, y));
+            region.enable(selector, z).unwrap();
+        });
+    }
+
+    region.increment(assigned_len);
 
     output.reshape(x.dims())?;
 
-    region.increment(x.len());
+    let elapsed = timer.elapsed();
+    trace!(
+        "nonlinearity {} layout took {:?}, row: {:?}",
+        <LookupOp as Op<F>>::as_string(nl),
+        elapsed,
+        region.row()
+    );
 
     // constrain the calculated output to a column
     Ok(output)
@@ -1478,36 +2362,78 @@ pub fn mean<F: PrimeField + TensorType + PartialOrd>(
     nonlinearity(config, region, &[sum_x], &nl)
 }
 
-/// abs layout
-pub fn abs<F: PrimeField + TensorType + PartialOrd>(
+/// Argmax
+pub fn argmax<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
-    values: &[ValTensor<F>],
+    values: &[ValTensor<F>; 1],
+    indices: ValTensor<F>,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
-    let x = &values[0];
-    // Negate the product
-    let neg_x = neg(config, region, &[x.clone()])?;
-    let relu_x = nonlinearity(config, region, &[x.clone()], &LookupOp::ReLU { scale: 1 })?;
-    let relu_neg_x = nonlinearity(config, region, &[neg_x], &LookupOp::ReLU { scale: 1 })?;
-    // abs(x) = relu(x) + relu(-x)
-    let abs = pairwise(config, region, &[relu_x, relu_neg_x], BaseOp::Add)?;
-
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(abs.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let mut ref_abs: Tensor<i32> =
-                tensor::ops::abs(&values[0].get_int_evals()?)?.map(|x| x as i32);
-            ref_abs.reshape(values[0].dims());
-
-            assert_eq!(Into::<Tensor<i32>>::into(abs.get_inner()?), ref_abs)
-        }
+    // this is safe because we later constrain it
+    let argmax = values[0]
+        .get_int_evals()?
+        .into_par_iter()
+        .enumerate()
+        // we value the first index in the case of a tie
+        .max_by_key(|(idx, value)| (*value, -(*idx as i64)))
+        .map(|(idx, _)| idx as i128);
+    let argmax_val: ValTensor<F> = match argmax {
+        None => Tensor::new(Some(&[Value::<F>::unknown()]), &[1])?.into(),
+        Some(i) => Tensor::new(Some(&[Value::known(i128_to_felt::<F>(i))]), &[1])?.into(),
     };
 
-    Ok(abs)
+    let assigned_argmax: ValTensor<F> = region.assign(&config.inputs[1], &argmax_val)?;
+    region.increment(assigned_argmax.len());
+
+    let claimed_val = select(
+        config,
+        region,
+        &[values[0].clone(), assigned_argmax.clone()],
+        indices,
+    )?;
+
+    let max_val = max(config, region, &[values[0].clone()])?;
+
+    enforce_equality(config, region, &[claimed_val, max_val])?;
+
+    Ok(assigned_argmax)
+}
+
+/// Argmin
+pub fn argmin<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    indices: ValTensor<F>,
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    // this is safe because we later constrain it
+    let argmin = values[0]
+        .get_int_evals()?
+        .into_par_iter()
+        .enumerate()
+        // we value the first index in the case of a tie
+        .min_by_key(|(idx, value)| (*value, (*idx as i64)))
+        .map(|(idx, _)| idx as i128);
+    let argmin_val: ValTensor<F> = match argmin {
+        None => Tensor::new(Some(&[Value::<F>::unknown()]), &[1])?.into(),
+        Some(i) => Tensor::new(Some(&[Value::known(i128_to_felt::<F>(i))]), &[1])?.into(),
+    };
+
+    let assigned_argmin: ValTensor<F> = region.assign(&config.inputs[1], &argmin_val)?;
+    region.increment(assigned_argmin.len());
+
+    // these will be assigned as constants
+    let claimed_val = select(
+        config,
+        region,
+        &[values[0].clone(), assigned_argmin.clone()],
+        indices,
+    )?;
+    let min_val = min(config, region, &[values[0].clone()])?;
+
+    enforce_equality(config, region, &[claimed_val, min_val])?;
+
+    Ok(assigned_argmin)
 }
 
 /// max layout
@@ -1517,14 +2443,14 @@ pub fn max<F: PrimeField + TensorType + PartialOrd>(
     values: &[ValTensor<F>; 1],
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     // this is safe because we later constrain it
-    let max_int = values[0].get_int_evals()?.into_iter().max();
+    let max_int = values[0].get_int_evals()?.into_par_iter().max();
     let max_val: ValTensor<F> = match max_int {
         None => Tensor::new(Some(&[Value::<F>::unknown()]), &[1])?.into(),
         Some(i) => Tensor::new(Some(&[Value::known(i128_to_felt::<F>(i))]), &[1])?.into(),
     };
 
-    let assigned_max_val = region.assign(&config.inputs[1], &max_val)?;
-    region.next();
+    let assigned_max_val: ValTensor<F> = region.assign(&config.inputs[1], &max_val)?;
+    region.increment(assigned_max_val.len());
 
     let unit: ValTensor<F> =
         Tensor::from(vec![region.assign_constant(&config.inputs[1], F::from(1))?].into_iter())
@@ -1547,18 +2473,20 @@ pub fn max<F: PrimeField + TensorType + PartialOrd>(
         BaseOp::Sub,
     )?;
     // relu(x - max(x - 1))
-    let relu = nonlinearity(config, region, &[diff], &LookupOp::ReLU { scale: 1 })?;
+    let relu = nonlinearity(config, region, &[diff], &LookupOp::ReLU)?;
 
     let len = relu.dims().iter().product();
 
     // y_i*(1 - y_i) =0 // assert the values are either 0 or 1
     region.assign(&config.inputs[1], &relu)?;
 
-    (0..len).for_each(|i| {
-        let (x, y) = config.inputs[1].cartesian_coord(region.offset() + i);
-        let selector = config.selectors.get(&(BaseOp::IsBoolean, x));
-        region.enable(selector, y).unwrap();
-    });
+    if !region.is_dummy() {
+        (0..len).for_each(|i| {
+            let (x, y, z) = config.inputs[1].cartesian_coord(region.linear_coord() + i);
+            let selector = config.selectors.get(&(BaseOp::IsBoolean, x, y));
+            region.enable(selector, z).unwrap();
+        });
+    }
 
     region.increment(len);
 
@@ -1567,37 +2495,17 @@ pub fn max<F: PrimeField + TensorType + PartialOrd>(
     // 1 - sum(relu(x - max(x - 1)))
     let one_minus_sum_relu = pairwise(config, region, &[unit, sum_relu], BaseOp::Sub)?;
     // relu(1 - sum(relu(x - max(x - 1))))
-    let relu_one_minus_sum_relu = nonlinearity(
-        config,
-        region,
-        &[one_minus_sum_relu],
-        &LookupOp::ReLU { scale: 1 },
-    )?;
+    let relu_one_minus_sum_relu =
+        nonlinearity(config, region, &[one_minus_sum_relu], &LookupOp::ReLU)?;
 
-    // constraining relu(sum(relu(x - max(x - 1)) - len(x))) = 0
+    // constraining 1 - sum(relu(x - max(x - 1))) = 0
     region.assign(&config.inputs[1], &relu_one_minus_sum_relu)?;
 
-    let (x, y) = config.output.cartesian_coord(region.offset());
-    let selector = config.selectors.get(&(BaseOp::IsZero, x));
-    region.enable(selector, y)?;
+    let (x, y, z) = config.output.cartesian_coord(region.linear_coord());
+    let selector = config.selectors.get(&(BaseOp::IsZero, x, y));
+    region.enable(selector, z)?;
 
     region.increment(relu_one_minus_sum_relu.len());
-
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(assigned_max_val.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let ref_max: Tensor<i32> = Tensor::new(
-                Some(&[values[0].get_int_evals()?.into_iter().max().unwrap() as i32]),
-                &[1],
-            )?;
-
-            assert_eq!(Into::<Tensor<i32>>::into(max_val.get_inner()?), ref_max,)
-        }
-    };
 
     Ok(assigned_max_val)
 }
@@ -1610,21 +2518,19 @@ pub fn min<F: PrimeField + TensorType + PartialOrd>(
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     // this is safe because we later constrain it
 
-    let min_int = values[0].get_int_evals()?.into_iter().min();
+    let min_int = values[0].get_int_evals()?.into_par_iter().min();
     let min_val: ValTensor<F> = match min_int {
         None => Tensor::new(Some(&[Value::<F>::unknown()]), &[1])?.into(),
         Some(i) => Tensor::new(Some(&[Value::known(i128_to_felt::<F>(i))]), &[1])?.into(),
     };
 
     let assigned_min_val = region.assign(&config.inputs[1], &min_val)?;
-    region.next();
+    region.increment(assigned_min_val.len());
 
     let unit: ValTensor<F> =
         Tensor::from(vec![region.assign_constant(&config.inputs[1], F::from(1))?].into_iter())
             .into();
     region.next();
-
-    // free up lock
 
     // min(x + 1)
     let min_plus_1 = pairwise(
@@ -1643,17 +2549,19 @@ pub fn min<F: PrimeField + TensorType + PartialOrd>(
     )?;
 
     // relu(min(x + 1)  - x)
-    let relu = nonlinearity(config, region, &[diff], &LookupOp::ReLU { scale: 1 })?;
+    let relu = nonlinearity(config, region, &[diff], &LookupOp::ReLU)?;
 
     let len = relu.dims().iter().product();
 
     region.assign(&config.inputs[1], &relu)?;
     // y_i*(1 - y_i) =0 // assert the values are either 0 or 1
-    (0..len).for_each(|i| {
-        let (x, y) = config.inputs[1].cartesian_coord(region.offset() + i);
-        let selector = config.selectors.get(&(BaseOp::IsBoolean, x));
-        region.enable(selector, y).unwrap();
-    });
+    if !region.is_dummy() {
+        (0..len).for_each(|i| {
+            let (x, y, z) = config.inputs[1].cartesian_coord(region.linear_coord() + i);
+            let selector = config.selectors.get(&(BaseOp::IsBoolean, x, y));
+            region.enable(selector, z).unwrap();
+        });
+    }
 
     region.increment(len);
 
@@ -1662,82 +2570,152 @@ pub fn min<F: PrimeField + TensorType + PartialOrd>(
     // 1 - sum(relu(min(x + 1) - x))
     let one_minus_sum_relu = pairwise(config, region, &[unit, sum_relu], BaseOp::Sub)?;
     // relu(1 - sum(relu(min(x + 1) - x)))
-    let relu_one_minus_sum_relu = nonlinearity(
-        config,
-        region,
-        &[one_minus_sum_relu],
-        &LookupOp::ReLU { scale: 1 },
-    )?;
+
+    let relu_one_minus_sum_relu =
+        nonlinearity(config, region, &[one_minus_sum_relu], &LookupOp::ReLU)?;
 
     region.assign(&config.inputs[1], &relu_one_minus_sum_relu)?;
 
     // constraining product to 0
-    let (x, y) = config.output.cartesian_coord(region.offset());
-    let selector = config.selectors.get(&(BaseOp::IsZero, x));
-    region.enable(selector, y)?;
+    let (x, y, z) = config.output.cartesian_coord(region.linear_coord());
+    let selector = config.selectors.get(&(BaseOp::IsZero, x, y));
+    region.enable(selector, z)?;
 
     region.increment(relu_one_minus_sum_relu.len());
 
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(assigned_min_val.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let ref_min: Tensor<i32> = Tensor::new(
-                Some(&[values[0].get_int_evals()?.into_iter().min().unwrap() as i32]),
-                &[1],
-            )?;
-
-            assert_eq!(Into::<Tensor<i32>>::into(min_val.get_inner()?), ref_min,)
-        }
-    };
     Ok(assigned_min_val)
 }
 
-/// softmax layout
-pub fn multi_dim_softmax<F: PrimeField + TensorType + PartialOrd>(
+fn multi_dim_axes_op<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 1],
-    input_scale: usize,
-    output_scale: usize,
+    axes: &[usize],
+    op: impl Fn(
+            &BaseConfig<F>,
+            &mut RegionCtx<F>,
+            &[ValTensor<F>; 1],
+        ) -> Result<ValTensor<F>, Box<dyn Error>>
+        + Send
+        + Sync,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
-    // we want this to be as small as possible so we set the output scale to 1
-    let dims = values[0].dims();
+    let mut input = values[0].clone();
 
-    if dims.len() == 1 {
-        return softmax(config, region, values, input_scale, output_scale);
+    if !input.all_prev_assigned() {
+        input = region.assign(&config.inputs[0], &input)?;
+        region.increment(input.len());
     }
 
-    let cartesian_coord = dims[..dims.len() - 1]
+    if input.dims().len() == 1 {
+        return op(config, region, &[input]);
+    }
+
+    // Calculate the output tensor size
+    let input_dims = input.dims();
+
+    let mut sorted_axes = axes.to_vec();
+    // descending order
+    sorted_axes.sort_by(|x, y| y.cmp(x));
+
+    let mut output_size_without_dim = input_dims.to_vec();
+    for dim in &sorted_axes {
+        output_size_without_dim.remove(*dim);
+    }
+
+    let mut op_tensors = Tensor::<ValTensor<F>>::new(None, &output_size_without_dim)?;
+
+    // Allocate memory for the output tensor
+    let cartesian_coord = output_size_without_dim
         .iter()
         .map(|x| 0..*x)
         .multi_cartesian_product()
         .collect::<Vec<_>>();
 
-    let mut outputs = vec![];
+    let inner_loop_function = |i: usize, region: &mut RegionCtx<F>| {
+        let coord = cartesian_coord[i].clone();
+        let mut slice = coord.iter().map(|x| *x..*x + 1).collect::<Vec<_>>();
 
-    for coord in cartesian_coord {
-        let mut sum_dims = vec![];
-        for c in coord {
-            sum_dims.push(c..c + 1);
+        for dim in &sorted_axes {
+            slice.insert(*dim, 0..input_dims[*dim]);
         }
-        sum_dims.push(0..dims[dims.len() - 1]);
 
-        let softmax_input = values[0].get_slice(&sum_dims)?;
+        let mut sliced_input = input.get_slice(&slice).unwrap();
+        sliced_input.flatten();
 
-        outputs.push(
-            softmax(config, region, &[softmax_input], input_scale, output_scale)?
-                .get_inner_tensor()?,
-        );
+        op(config, region, &[sliced_input]).unwrap()
+    };
+
+    if !region.is_dummy() {
+        op_tensors.iter_mut().enumerate().for_each(|(idx, o)| {
+            *o = inner_loop_function(idx, region);
+        });
+    } else {
+        region.dummy_loop(&mut op_tensors, inner_loop_function)?;
     }
 
-    let mut res = Tensor::new(Some(&outputs), &[outputs.len()])?.combine()?;
-    res.reshape(dims);
+    // assert all op_tensors have the same dims
+    let sample_op_output_size = op_tensors[0].dims();
 
-    Ok(res.into())
+    // now deduce the output size from the dims of the output tensors
+    let mut output_size = input_dims.to_vec();
+    for dim in axes.iter().enumerate() {
+        output_size[*dim.1] = sample_op_output_size[dim.0];
+    }
+
+    // Allocate memory for the output tensor
+    let cartesian_coord = output_size
+        .iter()
+        .map(|x| 0..*x)
+        .multi_cartesian_product()
+        .collect::<Vec<_>>();
+
+    let mut output = Tensor::<ValType<F>>::new(None, &output_size)?;
+
+    output = output.par_enum_map(|i, _| {
+        let coord = cartesian_coord[i].clone();
+        let mut op_idx = coord.clone();
+        let mut coord_at_dims = vec![];
+        for dim in &sorted_axes {
+            op_idx.remove(*dim);
+        }
+        for dim in axes {
+            coord_at_dims.push(coord[*dim]);
+        }
+
+        let topk_elem = op_tensors
+            .get(&op_idx)
+            .get_inner_tensor()
+            .map_err(|e| {
+                error!("{}", e);
+                halo2_proofs::plonk::Error::Synthesis
+            })?
+            .get(&coord_at_dims)
+            .clone();
+
+        Ok::<_, halo2_proofs::plonk::Error>(topk_elem)
+    })?;
+
+    Ok(output.into())
+}
+
+/// softmax layout
+pub fn softmax_axes<F: PrimeField + TensorType + PartialOrd>(
+    config: &BaseConfig<F>,
+    region: &mut RegionCtx<F>,
+    values: &[ValTensor<F>; 1],
+    scale: utils::F32,
+    axes: &[usize],
+) -> Result<ValTensor<F>, Box<dyn Error>> {
+    let soft_max_at_scale = move |config: &BaseConfig<F>,
+                                  region: &mut RegionCtx<F>,
+                                  values: &[ValTensor<F>; 1]|
+          -> Result<ValTensor<F>, Box<dyn Error>> {
+        softmax(config, region, values, scale)
+    };
+
+    let output = multi_dim_axes_op(config, region, values, axes, soft_max_at_scale)?;
+
+    Ok(output)
 }
 
 /// softmax func
@@ -1745,14 +2723,10 @@ pub fn softmax<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 1],
-    input_scale: usize,
-    output_scale: usize,
+    scale: utils::F32,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
-    // we want this to be as small as possible so we set the output scale to 1
-    let scales = (input_scale, output_scale);
-
     // elementwise exponential
-    let ex = nonlinearity(config, region, values, &LookupOp::Exp { scales })?;
+    let ex = nonlinearity(config, region, values, &LookupOp::Exp { scale })?;
 
     // sum of exps
     let denom = sum(config, region, &[ex.clone()])?;
@@ -1764,30 +2738,12 @@ pub fn softmax<F: PrimeField + TensorType + PartialOrd>(
         &[denom],
         // we set to input scale + output_scale so the output scale is output)scale
         &LookupOp::Recip {
-            scale: output_scale.pow(2),
+            scale: scale.0.powf(2.0).into(),
         },
     )?;
 
     // product of num * (1 / denom) = 2*output_scale
     let softmax = pairwise(config, region, &[ex, inv_denom], BaseOp::Mult)?;
-
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        // during key generation this will be 0 so we use this as a flag to check
-        // TODO: this isn't very safe and would be better to get the phase directly
-        let is_assigned = !Into::<Tensor<i32>>::into(softmax.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let int_evals = Tensor::new(Some(&values[0].get_int_evals()?), values[0].dims())?;
-            // scale is double the output
-            let ref_sofmax: Tensor<i128> =
-                tensor::ops::nonlinearities::softmax(&int_evals, input_scale, output_scale).0;
-
-            let output_int_evals = Tensor::new(Some(&softmax.get_int_evals()?), values[0].dims())?;
-
-            assert_eq!(output_int_evals, ref_sofmax,)
-        }
-    };
 
     Ok(softmax)
 }
@@ -1799,25 +2755,26 @@ pub fn range_check_percent<F: PrimeField + TensorType + PartialOrd>(
     config: &BaseConfig<F>,
     region: &mut RegionCtx<F>,
     values: &[ValTensor<F>; 2],
-    input_scale: usize,
-    output_scale: usize,
+    scale: utils::F32,
     tol: f32,
 ) -> Result<ValTensor<F>, Box<dyn Error>> {
     if tol == 0.0 {
         // regular equality constraint
-        return range_check(config, region, values, 0);
+        return enforce_equality(config, region, values);
     }
 
     // Calculate the difference between the expected output and actual output
     let diff = pairwise(config, region, values, BaseOp::Sub)?;
 
+    let scale_squared = scale.0.powf(2.0);
     // Calculate the reciprocal of the expected output tensor, scaling by double the scaling factor
-    let scale = input_scale * output_scale;
     let recip = nonlinearity(
         config,
         region,
         &[values[0].clone()],
-        &LookupOp::Recip { scale },
+        &LookupOp::Recip {
+            scale: scale_squared.into(),
+        },
     )?;
     // Multiply the difference by the recip
     let product = pairwise(config, region, &[diff, recip], BaseOp::Mult)?;
@@ -1829,7 +2786,7 @@ pub fn range_check_percent<F: PrimeField + TensorType + PartialOrd>(
         region,
         &[product.clone()],
         &LookupOp::GreaterThan {
-            a: utils::F32(tol * scale as f32),
+            a: utils::F32(tol * scale_squared),
         },
     )?;
 
@@ -1842,7 +2799,7 @@ pub fn range_check_percent<F: PrimeField + TensorType + PartialOrd>(
         region,
         &[neg_product],
         &LookupOp::GreaterThan {
-            a: utils::F32(tol * scale as f32),
+            a: utils::F32(tol * scale_squared),
         },
     )?;
 
@@ -1853,31 +2810,11 @@ pub fn range_check_percent<F: PrimeField + TensorType + PartialOrd>(
     region.assign(&config.inputs[1], &sum)?;
 
     // Constrain the sum to be all zeros
-    let (x, y) = config.output.cartesian_coord(region.offset());
-    let selector = config.selectors.get(&(BaseOp::IsZero, x));
-    region.enable(selector, y)?;
+    let (x, y, z) = config.output.cartesian_coord(region.linear_coord());
+    let selector = config.selectors.get(&(BaseOp::IsZero, x, y));
+    region.enable(selector, z)?;
 
     region.increment(sum.len());
 
-    if matches!(&config.check_mode, CheckMode::SAFE) {
-        let is_assigned = !Into::<Tensor<i32>>::into(sum.get_inner()?)
-            .iter()
-            .all(|&x| x == 0);
-        if is_assigned {
-            let int_evals = &[
-                Tensor::new(Some(&values[0].get_int_evals()?), values[0].dims())?,
-                Tensor::new(Some(&values[1].get_int_evals()?), values[1].dims())?,
-            ];
-            let ref_range_check_percent: Tensor<i128> =
-                tensor::ops::nonlinearities::range_check_percent(
-                    int_evals,
-                    input_scale,
-                    output_scale,
-                    tol,
-                );
-            let output_int_evals = Tensor::new(Some(&sum.get_int_evals()?), values[0].dims())?;
-            assert_eq!(output_int_evals, ref_range_check_percent)
-        }
-    }
     Ok(sum)
 }

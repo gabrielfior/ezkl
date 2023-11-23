@@ -23,7 +23,8 @@ struct MyConfig {
 #[derive(Clone)]
 struct MyCircuit<
     const LEN: usize, //LEN = CHOUT x OH x OW flattened
-    const BITS: usize,
+    const LOOKUP_MIN: i128,
+    const LOOKUP_MAX: i128,
 > {
     // Given the stateless MyConfig type information, a DNN trace is determined by its input and the parameters of its layers.
     // Computing the trace still requires a forward pass. The intermediate activations are stored only by the layouter.
@@ -33,7 +34,9 @@ struct MyCircuit<
     _marker: PhantomData<F>,
 }
 
-impl<const LEN: usize, const BITS: usize> Circuit<F> for MyCircuit<LEN, BITS> {
+impl<const LEN: usize, const LOOKUP_MIN: i128, const LOOKUP_MAX: i128> Circuit<F>
+    for MyCircuit<LEN, LOOKUP_MIN, LOOKUP_MAX>
+{
     type Config = MyConfig;
     type FloorPlanner = SimpleFloorPlanner;
     type Params = PhantomData<F>;
@@ -45,17 +48,29 @@ impl<const LEN: usize, const BITS: usize> Circuit<F> for MyCircuit<LEN, BITS> {
     // Here we wire together the layers by using the output advice in each layer as input advice in the next (not with copying / equality).
     // This can be automated but we will sometimes want skip connections, etc. so we need the flexibility.
     fn configure(cs: &mut ConstraintSystem<F>) -> Self::Config {
-        let input = VarTensor::new_advice(cs, K, LEN);
-        let params = VarTensor::new_advice(cs, K, LEN * LEN);
-        let output = VarTensor::new_advice(cs, K, LEN);
+        let input = VarTensor::new_advice(cs, K, 1, LEN);
+        let params = VarTensor::new_advice(cs, K, 1, LEN * LEN);
+        let output = VarTensor::new_advice(cs, K, 1, LEN);
         // tells the config layer to add an affine op to the circuit gate
 
-        let mut layer_config =
-            PolyConfig::<F>::configure(cs, &[input.clone(), params], &output, CheckMode::SAFE);
+        let mut layer_config = PolyConfig::<F>::configure(
+            cs,
+            &[input.clone(), params.clone()],
+            &output,
+            CheckMode::SAFE,
+        );
 
         // sets up a new ReLU table and resuses it for l1 and l3 non linearities
         layer_config
-            .configure_lookup(cs, &input, &output, BITS, &LookupOp::ReLU { scale: 1 })
+            .configure_lookup(
+                cs,
+                &input,
+                &output,
+                &params,
+                (LOOKUP_MIN, LOOKUP_MAX),
+                K,
+                &LookupOp::ReLU,
+            )
             .unwrap();
 
         // sets up a new ReLU table and resuses it for l1 and l3 non linearities
@@ -64,7 +79,9 @@ impl<const LEN: usize, const BITS: usize> Circuit<F> for MyCircuit<LEN, BITS> {
                 cs,
                 &input,
                 &output,
-                BITS,
+                &params,
+                (LOOKUP_MIN, LOOKUP_MAX),
+                K,
                 &LookupOp::Div {
                     denom: ezkl::circuit::utils::F32::from(128.),
                 },
@@ -91,7 +108,7 @@ impl<const LEN: usize, const BITS: usize> Circuit<F> for MyCircuit<LEN, BITS> {
             .assign_region(
                 || "mlp_4d",
                 |region| {
-                    let mut region = RegionCtx::new(region, 0);
+                    let mut region = RegionCtx::new(region, 0, 1);
                     let x = config
                         .layer_config
                         .layout(
@@ -104,30 +121,28 @@ impl<const LEN: usize, const BITS: usize> Circuit<F> for MyCircuit<LEN, BITS> {
                         .unwrap()
                         .unwrap();
                     println!("1");
-                    println!("offset: {}", region.offset());
+                    println!("offset: {}", region.row());
                     println!("x shape: {:?}", x.dims());
 
                     let x = config
                         .layer_config
                         .layout(
                             &mut region,
-                            &[x],
-                            Box::new(PolyOp::Add {
-                                a: Some(self.l0_params[1].clone()),
-                            }),
+                            &[x, self.l0_params[1].clone().into()],
+                            Box::new(PolyOp::Add),
                         )
                         .unwrap()
                         .unwrap();
                     println!("2");
-                    println!("offset: {}", region.offset());
+                    println!("offset: {}", region.row());
                     println!("x shape: {:?}", x.dims());
                     let mut x = config
                         .layer_config
-                        .layout(&mut region, &[x], Box::new(LookupOp::ReLU { scale: 1 }))
+                        .layout(&mut region, &[x], Box::new(LookupOp::ReLU))
                         .unwrap()
                         .unwrap();
                     println!("3");
-                    println!("offset: {}", region.offset());
+                    println!("offset: {}", region.row());
                     println!("x shape: {:?}", x.dims());
                     x.reshape(&[x.dims()[0], 1]).unwrap();
                     let x = config
@@ -142,29 +157,27 @@ impl<const LEN: usize, const BITS: usize> Circuit<F> for MyCircuit<LEN, BITS> {
                         .unwrap()
                         .unwrap();
                     println!("4");
-                    println!("offset: {}", region.offset());
+                    println!("offset: {}", region.row());
                     println!("x shape: {:?}", x.dims());
 
                     let x = config
                         .layer_config
                         .layout(
                             &mut region,
-                            &[x],
-                            Box::new(PolyOp::Add {
-                                a: Some(self.l2_params[1].clone()),
-                            }),
+                            &[x, self.l2_params[1].clone().into()],
+                            Box::new(PolyOp::Add),
                         )
                         .unwrap()
                         .unwrap();
                     println!("5");
-                    println!("offset: {}", region.offset());
+                    println!("offset: {}", region.row());
                     println!("x shape: {:?}", x.dims());
                     let x = config
                         .layer_config
-                        .layout(&mut region, &[x], Box::new(LookupOp::ReLU { scale: 1 }))
+                        .layout(&mut region, &[x], Box::new(LookupOp::ReLU))
                         .unwrap();
                     println!("6");
-                    println!("offset: {}", region.offset());
+                    println!("offset: {}", region.row());
                     Ok(config
                         .layer_config
                         .layout(
@@ -196,6 +209,7 @@ impl<const LEN: usize, const BITS: usize> Circuit<F> for MyCircuit<LEN, BITS> {
 }
 
 pub fn runmlp() {
+    #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
     // parameters
     let mut l0_kernel: Tensor<F> = Tensor::<i32>::new(
@@ -204,12 +218,12 @@ pub fn runmlp() {
     )
     .unwrap()
     .map(i32_to_felt);
-    l0_kernel.set_visibility(ezkl::graph::Visibility::Private);
+    l0_kernel.set_visibility(&ezkl::graph::Visibility::Private);
 
     let mut l0_bias: Tensor<F> = Tensor::<i32>::new(Some(&[0, 0, 0, 1]), &[4, 1])
         .unwrap()
         .map(i32_to_felt);
-    l0_bias.set_visibility(ezkl::graph::Visibility::Private);
+    l0_bias.set_visibility(&ezkl::graph::Visibility::Private);
 
     let mut l2_kernel: Tensor<F> = Tensor::<i32>::new(
         Some(&[0, 3, 10, -1, 0, 10, 1, 0, 0, 1, 0, 12, 1, -2, 32, 0]),
@@ -217,7 +231,7 @@ pub fn runmlp() {
     )
     .unwrap()
     .map(i32_to_felt);
-    l2_kernel.set_visibility(ezkl::graph::Visibility::Private);
+    l2_kernel.set_visibility(&ezkl::graph::Visibility::Private);
     // input data, with 1 padding to allow for bias
     let input: Tensor<Value<F>> = Tensor::<i32>::new(Some(&[-30, -21, 11, 40]), &[4, 1])
         .unwrap()
@@ -225,9 +239,9 @@ pub fn runmlp() {
     let mut l2_bias: Tensor<F> = Tensor::<i32>::new(Some(&[0, 0, 0, 1]), &[4, 1])
         .unwrap()
         .map(i32_to_felt);
-    l2_bias.set_visibility(ezkl::graph::Visibility::Private);
+    l2_bias.set_visibility(&ezkl::graph::Visibility::Private);
 
-    let circuit = MyCircuit::<4, 14> {
+    let circuit = MyCircuit::<4, -8192, 8192> {
         input: input.into(),
         l0_params: [l0_kernel, l0_bias],
         l2_params: [l2_kernel, l2_bias],

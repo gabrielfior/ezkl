@@ -5,6 +5,8 @@ pub mod evm;
 pub mod srs;
 
 use crate::circuit::CheckMode;
+use crate::graph::GraphWitness;
+use crate::pfsys::evm::aggregation::PoseidonTranscript;
 use crate::tensor::TensorType;
 use clap::ValueEnum;
 use halo2_proofs::circuit::Value;
@@ -12,6 +14,8 @@ use halo2_proofs::plonk::{
     create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ProvingKey, VerifyingKey,
 };
 use halo2_proofs::poly::commitment::{CommitmentScheme, Params, ParamsProver, Prover, Verifier};
+use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG};
+use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
 use halo2_proofs::poly::VerificationStrategy;
 use halo2_proofs::transcript::{EncodedChallenge, TranscriptReadBuffer, TranscriptWriterBuffer};
 use halo2curves::ff::{FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
@@ -19,19 +23,115 @@ use halo2curves::serde::SerdeObject;
 use halo2curves::CurveAffine;
 use instant::Instant;
 use log::{debug, info, trace};
+#[cfg(not(feature = "det-prove"))]
 use rand::rngs::OsRng;
+#[cfg(feature = "det-prove")]
+use rand::rngs::StdRng;
 use serde::de::DeserializeOwned;
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
+use snark_verifier::loader::native::NativeLoader;
+use snark_verifier::system::halo2::transcript::evm::EvmTranscript;
 use snark_verifier::system::halo2::{compile, Config};
 use snark_verifier::verifier::plonk::PlonkProtocol;
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Cursor, Write};
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::PathBuf;
 use thiserror::Error as thisError;
+
+use halo2curves::bn256::{Bn256, Fr, G1Affine};
+
+#[allow(missing_docs)]
+#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize, PartialOrd)]
+pub enum ProofType {
+    Single,
+    ForAggr,
+}
+
+impl From<ProofType> for TranscriptType {
+    fn from(val: ProofType) -> Self {
+        match val {
+            ProofType::Single => TranscriptType::EVM,
+            ProofType::ForAggr => TranscriptType::Poseidon,
+        }
+    }
+}
+
+impl From<ProofType> for StrategyType {
+    fn from(val: ProofType) -> Self {
+        match val {
+            ProofType::Single => StrategyType::Single,
+            ProofType::ForAggr => StrategyType::Accum,
+        }
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+impl ToPyObject for ProofType {
+    fn to_object(&self, py: Python) -> PyObject {
+        match self {
+            ProofType::Single => "Single".to_object(py),
+            ProofType::ForAggr => "ForAggr".to_object(py),
+        }
+    }
+}
+
+#[cfg(feature = "python-bindings")]
+/// Obtains StrategyType from PyObject (Required for StrategyType to be compatible with Python)
+impl<'source> pyo3::FromPyObject<'source> for ProofType {
+    fn extract(ob: &'source pyo3::PyAny) -> pyo3::PyResult<Self> {
+        let trystr = <pyo3::types::PyString as pyo3::PyTryFrom>::try_from(ob)?;
+        let strval = trystr.to_string();
+        match strval.to_lowercase().as_str() {
+            "single" => Ok(ProofType::Single),
+            "for-aggr" => Ok(ProofType::ForAggr),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(
+                "Invalid value for ProofType",
+            )),
+        }
+    }
+}
+
+#[allow(missing_docs)]
+#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum StrategyType {
+    Single,
+    Accum,
+}
+impl std::fmt::Display for StrategyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_possible_value()
+            .expect("no values are skipped")
+            .get_name()
+            .fmt(f)
+    }
+}
+#[cfg(feature = "python-bindings")]
+/// Converts StrategyType into a PyObject (Required for StrategyType to be compatible with Python)
+impl pyo3::IntoPy<PyObject> for StrategyType {
+    fn into_py(self, py: Python) -> PyObject {
+        match self {
+            StrategyType::Single => "single".to_object(py),
+            StrategyType::Accum => "accum".to_object(py),
+        }
+    }
+}
+#[cfg(feature = "python-bindings")]
+/// Obtains StrategyType from PyObject (Required for StrategyType to be compatible with Python)
+impl<'source> pyo3::FromPyObject<'source> for StrategyType {
+    fn extract(ob: &'source pyo3::PyAny) -> pyo3::PyResult<Self> {
+        let trystr = <pyo3::types::PyString as pyo3::PyTryFrom>::try_from(ob)?;
+        let strval = trystr.to_string();
+        match strval.to_lowercase().as_str() {
+            "single" => Ok(StrategyType::Single),
+            "accum" => Ok(StrategyType::Accum),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(
+                "Invalid value for StrategyType",
+            )),
+        }
+    }
+}
 
 #[derive(thisError, Debug)]
 /// Errors related to pfsys
@@ -42,9 +142,8 @@ pub enum PfSysError {
 }
 
 #[allow(missing_docs)]
-#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize, PartialOrd)]
 pub enum TranscriptType {
-    Blake,
     Poseidon,
     EVM,
 }
@@ -53,37 +152,32 @@ pub enum TranscriptType {
 impl ToPyObject for TranscriptType {
     fn to_object(&self, py: Python) -> PyObject {
         match self {
-            TranscriptType::Blake => "Blake".to_object(py),
             TranscriptType::Poseidon => "Poseidon".to_object(py),
             TranscriptType::EVM => "EVM".to_object(py),
         }
     }
 }
 
-/// converts field elem into `Vec<u64>`
-pub fn field_to_vecu64<F: PrimeField + SerdeObject + Serialize>(fp: &F) -> [u64; 4] {
-    let bytes: <F as PrimeField>::Repr = fp.to_repr();
-    let bytes_first_u64 = u64::from_le_bytes(bytes.as_ref()[0..8][..].try_into().unwrap());
-    let bytes_second_u64 = u64::from_le_bytes(bytes.as_ref()[8..16][..].try_into().unwrap());
-    let bytes_third_u64 = u64::from_le_bytes(bytes.as_ref()[16..24][..].try_into().unwrap());
-    let bytes_fourth_u64 = u64::from_le_bytes(bytes.as_ref()[24..32][..].try_into().unwrap());
-
-    [
-        bytes_first_u64,
-        bytes_second_u64,
-        bytes_third_u64,
-        bytes_fourth_u64,
-    ]
+#[cfg(feature = "python-bindings")]
+///
+pub fn g1affine_to_pydict(g1affine_dict: &PyDict, g1affine: &G1Affine) {
+    let g1affine_x = field_to_vecu64_montgomery(&g1affine.x);
+    let g1affine_y = field_to_vecu64_montgomery(&g1affine.y);
+    g1affine_dict.set_item("x", g1affine_x).unwrap();
+    g1affine_dict.set_item("y", g1affine_y).unwrap();
 }
-// consider further restricting the associated type: ` where <F as halo2curves::ff::PrimeField>::Repr: From<[u8; 32]>`
-/// convert [u64; 4] into field element
-pub fn vecu64_to_field<F: PrimeField + SerdeObject + FromUniformBytes<64>>(b: &[u64; 4]) -> F {
-    let mut bytes = [0u8; 64];
-    bytes[0..8].copy_from_slice(&b[0].to_le_bytes());
-    bytes[8..16].copy_from_slice(&b[1].to_le_bytes());
-    bytes[16..24].copy_from_slice(&b[2].to_le_bytes());
-    bytes[24..32].copy_from_slice(&b[3].to_le_bytes());
-    F::from_uniform_bytes(&bytes)
+
+#[cfg(feature = "python-bindings")]
+use halo2curves::bn256::G1;
+#[cfg(feature = "python-bindings")]
+///
+pub fn g1_to_pydict(g1_dict: &PyDict, g1: &G1) {
+    let g1_x = field_to_vecu64_montgomery(&g1.x);
+    let g1_y = field_to_vecu64_montgomery(&g1.y);
+    let g1_z = field_to_vecu64_montgomery(&g1.z);
+    g1_dict.set_item("x", g1_x).unwrap();
+    g1_dict.set_item("y", g1_y).unwrap();
+    g1_dict.set_item("z", g1_z).unwrap();
 }
 
 /// converts fp into `Vec<u64>` in Montgomery form
@@ -93,9 +187,22 @@ pub fn field_to_vecu64_montgomery<F: PrimeField + SerdeObject + Serialize>(fp: &
     b
 }
 
+/// converts `Vec<u64>` in Montgomery form into fp
+pub fn vecu64_to_field_montgomery<F: PrimeField + SerdeObject + Serialize + DeserializeOwned>(
+    b: &[u64; 4],
+) -> F {
+    let repr = serde_json::to_string(&b).unwrap();
+    let fp: F = serde_json::from_str(&repr).unwrap();
+    fp
+}
+
 /// An application snark with proof and instance variables ready for aggregation (raw field element)
-#[derive(Debug, Clone)]
-pub struct Snark<F: PrimeField + SerdeObject, C: CurveAffine> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snark<F: PrimeField + SerdeObject, C: CurveAffine>
+where
+    C::Scalar: Serialize + DeserializeOwned,
+    C::ScalarExt: Serialize + DeserializeOwned,
+{
     /// the protocol
     pub protocol: Option<PlonkProtocol<C>>,
     /// public instances of the snark
@@ -104,20 +211,24 @@ pub struct Snark<F: PrimeField + SerdeObject, C: CurveAffine> {
     pub proof: Vec<u8>,
     /// transcript type
     pub transcript_type: TranscriptType,
+    /// the split proof
+    pub split: Option<ProofSplitCommit>,
 }
 
 #[cfg(feature = "python-bindings")]
 use pyo3::{types::PyDict, PyObject, Python, ToPyObject};
 #[cfg(feature = "python-bindings")]
-impl<F: PrimeField + SerdeObject + Serialize, C: CurveAffine + Serialize> ToPyObject
-    for Snark<F, C>
+impl<F: PrimeField + SerdeObject + Serialize, C: CurveAffine + Serialize> ToPyObject for Snark<F, C>
+where
+    C::Scalar: Serialize + DeserializeOwned,
+    C::ScalarExt: Serialize + DeserializeOwned,
 {
     fn to_object(&self, py: Python) -> PyObject {
         let dict = PyDict::new(py);
         let field_elems: Vec<Vec<[u64; 4]>> = self
             .instances
             .iter()
-            .map(|x| x.iter().map(|fp| field_to_vecu64(fp)).collect())
+            .map(|x| x.iter().map(|fp| field_to_vecu64_montgomery(fp)).collect())
             .collect::<Vec<_>>();
         dict.set_item("instances", &field_elems).unwrap();
         let hex_proof = hex::encode(&self.proof);
@@ -128,145 +239,8 @@ impl<F: PrimeField + SerdeObject + Serialize, C: CurveAffine + Serialize> ToPyOb
     }
 }
 
-impl<F: PrimeField + SerdeObject + Serialize, C: CurveAffine + Serialize> Serialize for Snark<F, C>
-where
-    C::Scalar: serde::Serialize,
-    C::ScalarExt: serde::Serialize,
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // leave it untagged
-        let mut state = serializer.serialize_struct("", 2)?;
-        let field_elems: Vec<Vec<[u64; 4]>> = self
-            .instances
-            .iter()
-            .map(|x| x.iter().map(|fp| field_to_vecu64(fp)).collect())
-            .collect::<Vec<_>>();
-        state.serialize_field("instances", &field_elems)?;
-
-        let hex_proof = hex::encode(&self.proof);
-        state.serialize_field("proof", &hex_proof)?;
-        state.serialize_field("transcript_type", &self.transcript_type)?;
-        if self.protocol.is_some() {
-            state.serialize_field("protocol", &self.protocol)?;
-        }
-        state.end()
-    }
-}
-
 impl<
-        'de,
-        F: PrimeField + SerdeObject + Serialize + FromUniformBytes<64>,
-        C: CurveAffine + Serialize,
-    > Deserialize<'de> for Snark<F, C>
-where
-    C::Scalar: serde::Deserialize<'de>,
-    C: serde::Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        // leave it untagged
-        #[derive(Deserialize)]
-        #[serde(field_identifier, rename_all = "lowercase")]
-        enum Field {
-            Instances,
-            Proof,
-            #[serde(rename = "transcript_type")]
-            TranscriptType,
-            Protocol,
-        }
-
-        struct SnarkVisitor<F: PrimeField + SerdeObject, C: CurveAffine> {
-            _marker: std::marker::PhantomData<(F, C)>,
-        }
-
-        impl<'de, F: PrimeField + SerdeObject + FromUniformBytes<64>, C: CurveAffine>
-            serde::de::Visitor<'de> for SnarkVisitor<F, C>
-        where
-            C::Scalar: serde::Deserialize<'de>,
-            C: serde::Deserialize<'de>,
-        {
-            type Value = Snark<F, C>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("struct Snark")
-            }
-
-            fn visit_map<V>(self, mut map: V) -> Result<Snark<F, C>, V::Error>
-            where
-                V: serde::de::MapAccess<'de>,
-            {
-                let mut instances: Option<Vec<Vec<[u64; 4]>>> = None;
-                let mut proof: Option<String> = None;
-                let mut transcript_type = None;
-                let mut protocol = None;
-
-                while let Some(key) = map.next_key()? {
-                    match key {
-                        Field::Instances => {
-                            if instances.is_some() {
-                                return Err(serde::de::Error::duplicate_field("instances"));
-                            }
-                            instances = Some(map.next_value()?);
-                        }
-                        Field::Proof => {
-                            if proof.is_some() {
-                                return Err(serde::de::Error::duplicate_field("proof"));
-                            }
-                            proof = Some(map.next_value()?);
-                        }
-                        Field::TranscriptType => {
-                            if transcript_type.is_some() {
-                                return Err(serde::de::Error::duplicate_field("transcript_type"));
-                            }
-                            transcript_type = Some(map.next_value()?);
-                        }
-                        Field::Protocol => {
-                            if protocol.is_some() {
-                                return Err(serde::de::Error::duplicate_field("protocol"));
-                            }
-                            protocol = Some(map.next_value()?);
-                        }
-                    }
-                }
-                let instances =
-                    instances.ok_or_else(|| serde::de::Error::missing_field("instances"))?;
-                let proof = proof.ok_or_else(|| serde::de::Error::missing_field("proof"))?;
-                let transcript_type = transcript_type
-                    .ok_or_else(|| serde::de::Error::missing_field("transcript_type"))?;
-                // protocol can be optional
-
-                let instances: Vec<Vec<F>> = instances
-                    .iter()
-                    .map(|x| x.iter().map(|fp| vecu64_to_field(fp)).collect())
-                    .collect::<Vec<_>>();
-
-                let proof = hex::decode(proof).map_err(serde::de::Error::custom)?;
-
-                Ok(Snark {
-                    protocol,
-                    instances,
-                    proof,
-                    transcript_type,
-                })
-            }
-        }
-        deserializer.deserialize_struct(
-            "Snark",
-            &["instances", "proof", "transcript_type", "protocol"],
-            SnarkVisitor {
-                _marker: PhantomData,
-            },
-        )
-    }
-}
-
-impl<
-        F: PrimeField + SerdeObject + Serialize + FromUniformBytes<64>,
+        F: PrimeField + SerdeObject + Serialize + FromUniformBytes<64> + DeserializeOwned,
         C: CurveAffine + Serialize + DeserializeOwned,
     > Snark<F, C>
 where
@@ -279,12 +253,14 @@ where
         instances: Vec<Vec<F>>,
         proof: Vec<u8>,
         transcript_type: TranscriptType,
+        split: Option<ProofSplitCommit>,
     ) -> Self {
         Self {
             protocol: Some(protocol),
             instances,
             proof,
             transcript_type,
+            split,
         }
     }
 
@@ -309,12 +285,62 @@ where
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A proof split commit
+pub struct ProofSplitCommit {
+    /// The start index of the output in the witness
+    start: usize,
+    /// The end index of the output in the witness
+    end: usize,
+}
+
+impl From<GraphWitness> for Option<ProofSplitCommit> {
+    fn from(witness: GraphWitness) -> Self {
+        let mut elem_offset = 0;
+
+        if let Some(input) = witness.processed_inputs {
+            if let Some(kzg) = input.kzg_commit {
+                // flatten and count number of elements
+                let num_elements = kzg.iter().map(|kzg| kzg.len()).sum::<usize>();
+
+                elem_offset += num_elements;
+            }
+        }
+
+        if let Some(params) = witness.processed_params {
+            if let Some(kzg) = params.kzg_commit {
+                // flatten and count number of elements
+                let num_elements = kzg.iter().map(|kzg| kzg.len()).sum::<usize>();
+
+                elem_offset += num_elements;
+            }
+        }
+
+        if let Some(output) = witness.processed_outputs {
+            if let Some(kzg) = output.kzg_commit {
+                // flatten and count number of elements
+                let num_elements = kzg.iter().map(|kzg| kzg.len()).sum::<usize>();
+
+                Some(ProofSplitCommit {
+                    start: elem_offset,
+                    end: elem_offset + num_elements,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
 /// An application snark with proof and instance variables ready for aggregation (wrapped field element)
 #[derive(Clone, Debug)]
 pub struct SnarkWitness<F: PrimeField, C: CurveAffine> {
     protocol: Option<PlonkProtocol<C>>,
     instances: Vec<Vec<Value<F>>>,
     proof: Value<Vec<u8>>,
+    split: Option<ProofSplitCommit>,
 }
 
 impl<F: PrimeField, C: CurveAffine> SnarkWitness<F, C> {
@@ -327,6 +353,7 @@ impl<F: PrimeField, C: CurveAffine> SnarkWitness<F, C> {
                 .map(|instances| vec![Value::unknown(); instances.len()])
                 .collect(),
             proof: Value::unknown(),
+            split: self.split.clone(),
         }
     }
 
@@ -335,7 +362,11 @@ impl<F: PrimeField, C: CurveAffine> SnarkWitness<F, C> {
     }
 }
 
-impl<F: PrimeField + SerdeObject, C: CurveAffine> From<Snark<F, C>> for SnarkWitness<F, C> {
+impl<F: PrimeField + SerdeObject, C: CurveAffine> From<Snark<F, C>> for SnarkWitness<F, C>
+where
+    C::Scalar: Serialize + DeserializeOwned,
+    C::ScalarExt: Serialize + DeserializeOwned,
+{
     fn from(snark: Snark<F, C>) -> Self {
         Self {
             protocol: snark.protocol,
@@ -345,6 +376,7 @@ impl<F: PrimeField + SerdeObject, C: CurveAffine> From<Snark<F, C>> for SnarkWit
                 .map(|instances| instances.into_iter().map(Value::known).collect())
                 .collect(),
             proof: Value::known(snark.proof),
+            split: snark.split,
         }
     }
 }
@@ -377,6 +409,7 @@ where
 }
 
 /// a wrapper around halo2's create_proof
+#[allow(clippy::too_many_arguments)]
 pub fn create_proof_circuit<
     'params,
     Scheme: CommitmentScheme,
@@ -396,6 +429,7 @@ pub fn create_proof_circuit<
     strategy: Strategy,
     check_mode: CheckMode,
     transcript_type: TranscriptType,
+    split: Option<ProofSplitCommit>,
 ) -> Result<Snark<Scheme::Scalar, Scheme::Curve>, Box<dyn Error>>
 where
     C: Circuit<Scheme::Scalar>,
@@ -410,6 +444,9 @@ where
     Scheme::Curve: Serialize + DeserializeOwned,
 {
     let mut transcript = TranscriptWriterBuffer::<_, Scheme::Curve, _>::init(vec![]);
+    #[cfg(feature = "det-prove")]
+    let mut rng = <StdRng as rand::SeedableRng>::from_seed([0u8; 32]);
+    #[cfg(not(feature = "det-prove"))]
     let mut rng = OsRng;
     let number_instance = instances.iter().map(|x| x.len()).collect();
     trace!("number_instance {:?}", number_instance);
@@ -425,8 +462,15 @@ where
         .collect::<Vec<&[Scheme::Scalar]>>();
     let pi_inner: &[&[&[Scheme::Scalar]]] = &[&pi_inner];
     trace!("instances {:?}", instances);
+    trace!(
+        "pk num instance column: {:?}",
+        pk.get_vk().cs().num_instance_columns()
+    );
 
     info!("proof started...");
+    // not wasm32 unknown
+    let now = Instant::now();
+
     create_proof::<Scheme, P, _, _, TW, _>(
         params,
         pk,
@@ -437,7 +481,7 @@ where
     )?;
     let proof = transcript.finalize();
 
-    let checkable_pf = Snark::new(protocol, instances, proof, transcript_type);
+    let checkable_pf = Snark::new(protocol, instances, proof, transcript_type, split);
 
     // sanity check that the generated proof is valid
     if check_mode == CheckMode::SAFE {
@@ -450,8 +494,74 @@ where
             strategy,
         )?;
     }
+    let elapsed = now.elapsed();
+    info!(
+        "proof took {}.{}",
+        elapsed.as_secs(),
+        elapsed.subsec_millis()
+    );
 
     Ok(checkable_pf)
+}
+
+/// Swaps the proof commitments to a new set in the proof
+pub fn swap_proof_commitments<
+    F: PrimeField,
+    Scheme: CommitmentScheme,
+    E: EncodedChallenge<Scheme::Curve>,
+    TW: TranscriptWriterBuffer<Vec<u8>, Scheme::Curve, E>,
+>(
+    snark: &Snark<Scheme::Scalar, Scheme::Curve>,
+    commitments: &[Scheme::Curve],
+) -> Result<Snark<Scheme::Scalar, Scheme::Curve>, Box<dyn Error>>
+where
+    Scheme::Scalar: SerdeObject
+        + PrimeField
+        + FromUniformBytes<64>
+        + WithSmallOrderMulGroup<3>
+        + Ord
+        + Serialize
+        + DeserializeOwned,
+    Scheme::Curve: Serialize + DeserializeOwned,
+{
+    let mut transcript_new: TW = TranscriptWriterBuffer::<_, Scheme::Curve, _>::init(vec![]);
+
+    // kzg commitments are the first set of points in the proof, this we'll always be the first set of advice
+    for commit in commitments {
+        transcript_new
+            .write_point(*commit)
+            .map_err(|_| "failed to write point")?;
+    }
+
+    let proof_first_bytes = transcript_new.finalize();
+
+    let mut snark_new = snark.clone();
+    // swap the proof bytes for the new ones
+    snark_new.proof[..proof_first_bytes.len()].copy_from_slice(&proof_first_bytes);
+
+    Ok(snark_new)
+}
+
+/// Swap the proof commitments to a new set in the proof for KZG
+pub fn swap_proof_commitments_kzg(
+    snark: &Snark<Fr, G1Affine>,
+    commitments: &[G1Affine],
+) -> Result<Snark<Fr, G1Affine>, Box<dyn Error>> {
+    let proof = match snark.transcript_type {
+        TranscriptType::EVM => swap_proof_commitments::<
+            Fr,
+            KZGCommitmentScheme<Bn256>,
+            _,
+            EvmTranscript<G1Affine, _, _, _>,
+        >(snark, commitments)?,
+        TranscriptType::Poseidon => swap_proof_commitments::<
+            Fr,
+            KZGCommitmentScheme<Bn256>,
+            _,
+            PoseidonTranscript<NativeLoader, _>,
+        >(snark, commitments)?,
+    };
+    Ok(proof)
 }
 
 /// A wrapper around halo2's verify_proof
@@ -470,8 +580,14 @@ pub fn verify_proof_circuit<
     strategy: Strategy,
 ) -> Result<Strategy::Output, halo2_proofs::plonk::Error>
 where
-    Scheme::Scalar:
-        SerdeObject + PrimeField + FromUniformBytes<64> + WithSmallOrderMulGroup<3> + Ord,
+    Scheme::Scalar: SerdeObject
+        + PrimeField
+        + FromUniformBytes<64>
+        + WithSmallOrderMulGroup<3>
+        + Ord
+        + Serialize
+        + DeserializeOwned,
+    Scheme::Curve: Serialize + DeserializeOwned,
 {
     let pi_inner = snark
         .instances
@@ -496,7 +612,8 @@ where
     Scheme::Scalar: PrimeField + SerdeObject + FromUniformBytes<64>,
 {
     info!("loading verification key from {:?}", path);
-    let f = File::open(path)?;
+    let f =
+        File::open(path.clone()).map_err(|_| format!("failed to load vk at {}", path.display()))?;
     let mut reader = BufReader::new(f);
     VerifyingKey::<Scheme::Curve>::read::<_, C>(
         &mut reader,
@@ -517,7 +634,8 @@ where
     Scheme::Scalar: PrimeField + SerdeObject + FromUniformBytes<64>,
 {
     info!("loading proving key from {:?}", path);
-    let f = File::open(path)?;
+    let f =
+        File::open(path.clone()).map_err(|_| format!("failed to load pk at {}", path.display()))?;
     let mut reader = BufReader::new(f);
     ProvingKey::<Scheme::Curve>::read::<_, C>(
         &mut reader,
@@ -574,6 +692,109 @@ pub fn save_params<Scheme: CommitmentScheme>(
     Ok(())
 }
 
+/// helper function
+#[allow(clippy::too_many_arguments)]
+pub fn create_proof_circuit_kzg<
+    'params,
+    C: Circuit<Fr>,
+    Strategy: VerificationStrategy<'params, KZGCommitmentScheme<Bn256>, VerifierSHPLONK<'params, Bn256>>,
+>(
+    circuit: C,
+    params: &'params ParamsKZG<Bn256>,
+    public_inputs: Option<Vec<Fr>>,
+    pk: &ProvingKey<G1Affine>,
+    transcript: TranscriptType,
+    strategy: Strategy,
+    check_mode: CheckMode,
+    split: Option<ProofSplitCommit>,
+) -> Result<Snark<Fr, G1Affine>, Box<dyn Error>> {
+    let public_inputs = if let Some(public_inputs) = public_inputs {
+        if !public_inputs.is_empty() {
+            vec![public_inputs]
+        } else {
+            vec![vec![]]
+        }
+    } else {
+        vec![]
+    };
+
+    match transcript {
+        TranscriptType::EVM => create_proof_circuit::<
+            KZGCommitmentScheme<_>,
+            Fr,
+            _,
+            ProverSHPLONK<_>,
+            VerifierSHPLONK<_>,
+            _,
+            _,
+            EvmTranscript<G1Affine, _, _, _>,
+            EvmTranscript<G1Affine, _, _, _>,
+        >(
+            circuit,
+            public_inputs,
+            params,
+            pk,
+            strategy,
+            check_mode,
+            transcript,
+            split,
+        )
+        .map_err(Box::<dyn Error>::from),
+        TranscriptType::Poseidon => create_proof_circuit::<
+            KZGCommitmentScheme<_>,
+            Fr,
+            _,
+            ProverSHPLONK<_>,
+            VerifierSHPLONK<_>,
+            _,
+            _,
+            PoseidonTranscript<NativeLoader, _>,
+            PoseidonTranscript<NativeLoader, _>,
+        >(
+            circuit,
+            public_inputs,
+            params,
+            pk,
+            strategy,
+            check_mode,
+            transcript,
+            split,
+        )
+        .map_err(Box::<dyn Error>::from),
+    }
+}
+
+#[allow(unused)]
+/// helper function
+pub(crate) fn verify_proof_circuit_kzg<
+    'params,
+    Strategy: VerificationStrategy<'params, KZGCommitmentScheme<Bn256>, VerifierSHPLONK<'params, Bn256>>,
+>(
+    params: &'params ParamsKZG<Bn256>,
+    proof: Snark<Fr, G1Affine>,
+    vk: &VerifyingKey<G1Affine>,
+    strategy: Strategy,
+) -> Result<Strategy::Output, halo2_proofs::plonk::Error> {
+    match proof.transcript_type {
+        TranscriptType::EVM => verify_proof_circuit::<
+            Fr,
+            VerifierSHPLONK<'_, Bn256>,
+            _,
+            _,
+            _,
+            EvmTranscript<G1Affine, _, _, _>,
+        >(&proof, params, vk, strategy),
+        TranscriptType::Poseidon => verify_proof_circuit::<
+            Fr,
+            VerifierSHPLONK<'_, Bn256>,
+            _,
+            _,
+            _,
+            PoseidonTranscript<NativeLoader, _>,
+        >(&proof, params, vk, strategy),
+    }
+}
+
 ////////////////////////
 
 #[cfg(test)]
@@ -628,6 +849,7 @@ mod tests {
             instances: vec![vec![Fr::from(1)], vec![Fr::from(2)]],
             transcript_type: TranscriptType::EVM,
             protocol: None,
+            split: None,
         };
 
         snark

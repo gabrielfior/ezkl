@@ -9,7 +9,7 @@ jobs:
   bench_elgamal:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -21,7 +21,7 @@ jobs:
   bench_poseidon:
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -34,7 +34,7 @@ jobs:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -47,7 +47,7 @@ jobs:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -56,11 +56,24 @@ jobs:
       - name: Bench accum matmul relu
         run: cargo bench --verbose --bench accum_matmul_relu
 
+  bench_accum_matmul_relu_overflow:
+    runs-on: self-hosted
+    needs: [bench_poseidon]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2023-06-27
+          override: true
+          components: rustfmt, clippy
+      - name: Bench accum matmul relu
+        run: cargo bench --verbose --bench accum_matmul_relu_overflow
+
   bench_relu:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -73,7 +86,7 @@ jobs:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -86,7 +99,7 @@ jobs:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -99,7 +112,7 @@ jobs:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -112,7 +125,7 @@ jobs:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -125,7 +138,7 @@ jobs:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -138,7 +151,7 @@ jobs:
     runs-on: self-hosted
     needs: [bench_poseidon]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly-2023-06-27
@@ -146,5 +159,3 @@ jobs:
           components: rustfmt, clippy
       - name: Bench pairwise pow
         run: cargo bench --verbose --bench pairwise_pow
-
-

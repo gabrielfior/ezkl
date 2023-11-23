@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ezkl::circuit::poly::PolyOp;
 use ezkl::circuit::*;
-use ezkl::execute::create_proof_circuit_kzg;
 use ezkl::pfsys::create_keys;
+use ezkl::pfsys::create_proof_circuit_kzg;
 use ezkl::pfsys::srs::gen_srs;
 use ezkl::pfsys::TranscriptType;
 use ezkl::tensor::*;
@@ -44,11 +44,11 @@ impl Circuit<Fr> for MyCircuit {
     fn configure(cs: &mut ConstraintSystem<Fr>) -> Self::Config {
         let len = 10;
 
-        let a = VarTensor::new_advice(cs, K, len * len);
+        let a = VarTensor::new_advice(cs, K, 1, len * len);
 
-        let b = VarTensor::new_advice(cs, K, len * len);
+        let b = VarTensor::new_advice(cs, K, 1, len * len);
 
-        let output = VarTensor::new_advice(cs, K, (len + 1) * len);
+        let output = VarTensor::new_advice(cs, K, 1, (len + 1) * len);
 
         Self::Config::configure(cs, &[a, b], &output, CheckMode::UNSAFE)
     }
@@ -61,7 +61,7 @@ impl Circuit<Fr> for MyCircuit {
         layouter.assign_region(
             || "",
             |region| {
-                let mut region = region::RegionCtx::new(region, 0);
+                let mut region = region::RegionCtx::new(region, 0, 1);
                 config
                     .layout(
                         &mut region,
@@ -69,7 +69,7 @@ impl Circuit<Fr> for MyCircuit {
                         Box::new(PolyOp::Conv {
                             kernel: self.kernel.clone(),
                             bias: Some(self.bias.clone()),
-                            padding: (0, 0),
+                            padding: [(0, 0); 2],
                             stride: (1, 1),
                         }),
                     )
@@ -105,10 +105,10 @@ fn runcnvrl(c: &mut Criterion) {
                     .map(|_| Fr::random(OsRng)),
             );
             kernel.reshape(&[OUT_CHANNELS, IN_CHANNELS, KERNEL_HEIGHT, KERNEL_WIDTH]);
-            kernel.set_visibility(ezkl::graph::Visibility::Private);
+            kernel.set_visibility(&ezkl::graph::Visibility::Private);
 
             let mut bias = Tensor::from((0..{ OUT_CHANNELS }).map(|_| Fr::random(OsRng)));
-            bias.set_visibility(ezkl::graph::Visibility::Private);
+            bias.set_visibility(&ezkl::graph::Visibility::Private);
 
             let circuit = MyCircuit {
                 image: ValTensor::from(image),
@@ -133,11 +133,12 @@ fn runcnvrl(c: &mut Criterion) {
                     let prover = create_proof_circuit_kzg(
                         circuit.clone(),
                         &params,
-                        vec![],
+                        None,
                         &pk,
-                        TranscriptType::Blake,
+                        TranscriptType::EVM,
                         SingleStrategy::new(&params),
                         CheckMode::UNSAFE,
+                        None,
                     );
                     prover.unwrap();
                 });

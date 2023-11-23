@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use ezkl::circuit::region::RegionCtx;
 use ezkl::circuit::{ops::lookup::LookupOp, BaseConfig as Config, CheckMode};
-use ezkl::execute::create_proof_circuit_kzg;
+use ezkl::pfsys::create_proof_circuit_kzg;
 use ezkl::pfsys::TranscriptType;
 use ezkl::pfsys::{create_keys, srs::gen_srs};
 use ezkl::tensor::*;
@@ -14,7 +14,7 @@ use halo2_proofs::{
 use halo2curves::bn256::{Bn256, Fr};
 use rand::Rng;
 
-const BITS: usize = 8;
+const BITS: (i128, i128) = (-32768, 32768);
 static mut LEN: usize = 4;
 const K: usize = 16;
 
@@ -34,16 +34,16 @@ impl Circuit<Fr> for NLCircuit {
 
     fn configure(cs: &mut ConstraintSystem<Fr>) -> Self::Config {
         unsafe {
-            let advices = (0..2)
-                .map(|_| VarTensor::new_advice(cs, K, LEN))
+            let advices = (0..3)
+                .map(|_| VarTensor::new_advice(cs, K, 1, LEN))
                 .collect::<Vec<_>>();
 
-            let nl = LookupOp::ReLU { scale: 128 };
+            let nl = LookupOp::ReLU;
 
             let mut config = Config::default();
 
             config
-                .configure_lookup(cs, &advices[0], &advices[1], BITS, &nl)
+                .configure_lookup(cs, &advices[0], &advices[1], &advices[2], BITS, K, &nl)
                 .unwrap();
 
             config
@@ -59,13 +59,9 @@ impl Circuit<Fr> for NLCircuit {
         layouter.assign_region(
             || "",
             |region| {
-                let mut region = RegionCtx::new(region, 0);
+                let mut region = RegionCtx::new(region, 0, 1);
                 config
-                    .layout(
-                        &mut region,
-                        &[self.input.clone()],
-                        Box::new(LookupOp::ReLU { scale: 128 }),
-                    )
+                    .layout(&mut region, &[self.input.clone()], Box::new(LookupOp::ReLU))
                     .unwrap();
                 Ok(())
             },
@@ -108,11 +104,12 @@ fn runrelu(c: &mut Criterion) {
                 let prover = create_proof_circuit_kzg(
                     circuit.clone(),
                     &params,
-                    vec![],
+                    None,
                     &pk,
-                    TranscriptType::Blake,
+                    TranscriptType::EVM,
                     SingleStrategy::new(&params),
                     CheckMode::SAFE,
+                    None,
                 );
                 prover.unwrap();
             });

@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(not(target_arch = "wasm32"))]
 use ethers::types::H160;
 #[cfg(feature = "python-bindings")]
@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::PathBuf;
 
-use crate::circuit::{CheckMode, Tolerance};
+use crate::{pfsys::ProofType, RunArgs};
+
+use crate::circuit::CheckMode;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::graph::TestDataSource;
-use crate::graph::Visibility;
 use crate::pfsys::TranscriptType;
 
 impl std::fmt::Display for TranscriptType {
@@ -31,7 +32,6 @@ impl std::fmt::Display for TranscriptType {
 impl IntoPy<PyObject> for TranscriptType {
     fn into_py(self, py: Python) -> PyObject {
         match self {
-            TranscriptType::Blake => "blake".to_object(py),
             TranscriptType::Poseidon => "poseidon".to_object(py),
             TranscriptType::EVM => "evm".to_object(py),
         }
@@ -44,7 +44,6 @@ impl<'source> FromPyObject<'source> for TranscriptType {
         let trystr = <PyString as PyTryFrom>::try_from(ob)?;
         let strval = trystr.to_string();
         match strval.to_lowercase().as_str() {
-            "blake" => Ok(TranscriptType::Blake),
             "poseidon" => Ok(TranscriptType::Poseidon),
             "evm" => Ok(TranscriptType::EVM),
             _ => Err(PyValueError::new_err("Invalid value for TranscriptType")),
@@ -52,58 +51,47 @@ impl<'source> FromPyObject<'source> for TranscriptType {
     }
 }
 
-#[allow(missing_docs)]
-#[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum StrategyType {
-    Single,
-    Accum,
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
+/// Determines what the calibration pass should optimize for
+pub enum CalibrationTarget {
+    /// Optimizes for reducing cpu and memory usage
+    Resources {
+        /// Whether to allow for column overflow. This can reduce memory usage (eg. for a browser environment), but may result in a verifier that doesn't fit on the blockchain.
+        col_overflow: bool,
+    },
+    /// Optimizes for numerical accuracy given the fixed point representation
+    Accuracy,
 }
-impl std::fmt::Display for StrategyType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.to_possible_value()
-            .expect("no values are skipped")
-            .get_name()
-            .fmt(f)
-    }
-}
-#[cfg(feature = "python-bindings")]
-/// Converts StrategyType into a PyObject (Required for StrategyType to be compatible with Python)
-impl IntoPy<PyObject> for StrategyType {
-    fn into_py(self, py: Python) -> PyObject {
-        match self {
-            StrategyType::Single => "single".to_object(py),
-            StrategyType::Accum => "accum".to_object(py),
-        }
-    }
-}
-#[cfg(feature = "python-bindings")]
-/// Obtains StrategyType from PyObject (Required for StrategyType to be compatible with Python)
-impl<'source> FromPyObject<'source> for StrategyType {
-    fn extract(ob: &'source PyAny) -> PyResult<Self> {
-        let trystr = <PyString as PyTryFrom>::try_from(ob)?;
-        let strval = trystr.to_string();
-        match strval.to_lowercase().as_str() {
-            "single" => Ok(StrategyType::Single),
-            "accum" => Ok(StrategyType::Accum),
-            _ => Err(PyValueError::new_err("Invalid value for StrategyType")),
+
+impl Default for CalibrationTarget {
+    fn default() -> Self {
+        CalibrationTarget::Resources {
+            col_overflow: false,
         }
     }
 }
 
-#[derive(clap::ValueEnum, Debug, Default, Copy, Clone, Serialize, Deserialize)]
-/// Determines what the calibration pass should optimize for
-pub enum CalibrationTarget {
-    /// Optimizes for reducing cpu and memory usage
-    #[default]
-    Resources,
-    /// Optimizes for numerical accuracy given the fixed point representation
-    Accuracy,
+impl ToString for CalibrationTarget {
+    fn to_string(&self) -> String {
+        match self {
+            CalibrationTarget::Resources { col_overflow: true } => {
+                "resources/col-overflow".to_string()
+            }
+            CalibrationTarget::Resources {
+                col_overflow: false,
+            } => "resources".to_string(),
+            CalibrationTarget::Accuracy => "accuracy".to_string(),
+        }
+    }
 }
 
 impl From<&str> for CalibrationTarget {
     fn from(s: &str) -> Self {
         match s {
-            "resources" => CalibrationTarget::Resources,
+            "resources" => CalibrationTarget::Resources {
+                col_overflow: false,
+            },
+            "resources/col-overflow" => CalibrationTarget::Resources { col_overflow: true },
             "accuracy" => CalibrationTarget::Accuracy,
             _ => panic!("invalid calibration target"),
         }
@@ -115,7 +103,12 @@ impl From<&str> for CalibrationTarget {
 impl IntoPy<PyObject> for CalibrationTarget {
     fn into_py(self, py: Python) -> PyObject {
         match self {
-            CalibrationTarget::Resources => "resources".to_object(py),
+            CalibrationTarget::Resources { col_overflow: true } => {
+                "resources/col-overflow".to_object(py)
+            }
+            CalibrationTarget::Resources {
+                col_overflow: false,
+            } => "resources".to_object(py),
             CalibrationTarget::Accuracy => "accuracy".to_object(py),
         }
     }
@@ -128,48 +121,32 @@ impl<'source> FromPyObject<'source> for CalibrationTarget {
         let trystr = <PyString as PyTryFrom>::try_from(ob)?;
         let strval = trystr.to_string();
         match strval.to_lowercase().as_str() {
-            "resources" => Ok(CalibrationTarget::Resources),
+            "resources" => Ok(CalibrationTarget::Resources {
+                col_overflow: false,
+            }),
+            "resources/col-overflow" => Ok(CalibrationTarget::Resources { col_overflow: true }),
             "accuracy" => Ok(CalibrationTarget::Accuracy),
             _ => Err(PyValueError::new_err("Invalid value for CalibrationTarget")),
         }
     }
 }
 
-/// Parameters specific to a proving run
-#[derive(Debug, Copy, Args, Deserialize, Serialize, Clone, Default, PartialEq, PartialOrd)]
-pub struct RunArgs {
-    /// The tolerance for error on model outputs
-    #[arg(short = 'T', long, default_value = "0")]
-    pub tolerance: Tolerance,
-    /// The denominator in the fixed point representation used when quantizing
-    #[arg(short = 'S', long, default_value = "7")]
-    pub scale: u32,
-    /// The number of bits used in lookup tables
-    #[arg(short = 'B', long, default_value = "16")]
-    pub bits: usize,
-    /// The log_2 number of rows
-    #[arg(short = 'K', long, default_value = "17")]
-    pub logrows: u32,
-    /// The number of batches to split the input data into
-    #[arg(long, default_value = "1")]
-    pub batch_size: usize,
-    /// Flags whether inputs are public, private, hashed
-    #[arg(long, default_value = "private")]
-    pub input_visibility: Visibility,
-    /// Flags whether outputs are public, private, hashed
-    #[arg(long, default_value = "public")]
-    pub output_visibility: Visibility,
-    /// Flags whether params are public, private, hashed
-    #[arg(long, default_value = "private")]
-    pub param_visibility: Visibility,
-    /// the number of constraints the circuit might use. If not specified, this will be calculated using a 'dummy layout' pass.
-    #[arg(long)]
-    pub allocated_constraints: Option<usize>,
+use lazy_static::lazy_static;
+
+// if CARGO VERSION is 0.0.0 replace with "source - no compatibility guaranteed"
+lazy_static! {
+    /// The version of the ezkl library
+    pub static ref VERSION: &'static str =  if env!("CARGO_PKG_VERSION") == "0.0.0" {
+       "source - no compatibility guaranteed"
+    } else {
+        env!("CARGO_PKG_VERSION")
+    };
 }
 
 #[allow(missing_docs)]
 #[derive(Parser, Debug, Clone, Deserialize, Serialize)]
-#[command(author, version, about, long_about = None)]
+#[command(author, about, long_about = None)]
+#[clap(version = *VERSION)]
 pub struct Cli {
     #[command(subcommand)]
     #[allow(missing_docs)]
@@ -194,8 +171,9 @@ impl Cli {
 }
 
 #[allow(missing_docs)]
-#[derive(Debug, Subcommand, Clone, Deserialize, Serialize)]
+#[derive(Debug, Subcommand, Clone, Deserialize, Serialize, PartialEq, PartialOrd)]
 pub enum Commands {
+    Empty,
     /// Loads model and prints model table
     #[command(arg_required_else_help = true)]
     Table {
@@ -230,13 +208,16 @@ pub enum Commands {
         data: PathBuf,
         /// The path to the compiled model file
         #[arg(short = 'M', long)]
-        compiled_model: PathBuf,
+        compiled_circuit: PathBuf,
         /// Path to the witness (public and private inputs) .json file
         #[arg(short = 'O', long, default_value = "witness.json")]
         output: PathBuf,
-        /// Path to circuit_settings .json file to read in
-        #[arg(short = 'S', long)]
-        settings_path: PathBuf,
+        /// Path to the witness (public and private inputs) .json file (optional - solely used to generate kzg commits)
+        #[arg(short = 'V', long)]
+        vk_path: Option<PathBuf>,
+        /// Path to the srs file (optional - solely used to generate kzg commits)
+        #[arg(short = 'P', long)]
+        srs_path: Option<PathBuf>,
     },
 
     /// Produces the proving hyperparameters, from run-args
@@ -269,6 +250,12 @@ pub enum Commands {
         #[arg(long = "target", default_value = "resources")]
         /// Target for calibration.
         target: CalibrationTarget,
+        /// Optional scales to specifically try for calibration.
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        scales: Option<Vec<crate::Scale>>,
+        /// max logrows to use for calibration, 26 is the max public SRS size
+        #[arg(long)]
+        max_logrows: Option<u32>,
     },
 
     /// Generates a dummy SRS
@@ -289,10 +276,13 @@ pub enum Commands {
         /// The path to output to the desired srs file
         #[arg(long, default_value = "kzg.srs")]
         srs_path: PathBuf,
-        /// Path to circuit_settings file to read in
-        #[arg(short = 'S', long)]
-        settings_path: PathBuf,
-        /// check mode for srs. verifies downloaded srs is valid. set to unsafe for speed.
+        /// Path to circuit_settings file to read in. Overrides logrows if specified.
+        #[arg(short = 'S', long, default_value = None)]
+        settings_path: Option<PathBuf>,
+        /// Number of logrows to use for srs. To manually override the logrows, omit specifying the settings_path
+        #[arg(long, default_value = None)]
+        logrows: Option<u32>,
+        /// Check mode for srs. verifies downloaded srs is valid. set to unsafe for speed.
         #[arg(long, default_value = "safe")]
         check: CheckMode,
     },
@@ -305,9 +295,6 @@ pub enum Commands {
         /// The path to the .onnx model file
         #[arg(short = 'M', long)]
         model: PathBuf,
-        /// circuit params path
-        #[arg(short = 'S', long)]
-        settings_path: PathBuf,
     },
 
     /// Mock aggregate proofs
@@ -319,6 +306,9 @@ pub enum Commands {
         /// logrows used for aggregation circuit
         #[arg(long)]
         logrows: u32,
+        /// whether the accumulated are segments of a larger proof
+        #[arg(long, default_value = "false")]
+        split_proofs: bool,
     },
 
     /// setup aggregation circuit :)
@@ -327,7 +317,7 @@ pub enum Commands {
         /// The path to samples of snarks that will be aggregated over
         #[arg(long)]
         sample_snarks: Vec<PathBuf>,
-        /// The path to save the desired verfication key file
+        /// The path to save the desired verification key file
         #[arg(long, default_value = "vk_aggr.key")]
         vk_path: PathBuf,
         /// The path to save the desired proving key file
@@ -339,6 +329,9 @@ pub enum Commands {
         /// logrows used for aggregation circuit
         #[arg(long)]
         logrows: u32,
+        /// whether the accumulated are segments of a larger proof
+        #[arg(long, default_value = "false")]
+        split_proofs: bool,
     },
     /// Aggregates proofs :)
     #[command(arg_required_else_help = true)]
@@ -346,8 +339,8 @@ pub enum Commands {
         /// The path to the snarks to aggregate over
         #[arg(long)]
         aggregation_snarks: Vec<PathBuf>,
-        /// The path to load the desired verfication key file
-        #[arg(long, default_value = "vk_aggr.key")]
+        /// The path to load the desired proving key file
+        #[arg(long)]
         pk_path: PathBuf,
         /// The path to the desired output file
         #[arg(long, default_value = "proof_aggr.proof")]
@@ -369,16 +362,19 @@ pub enum Commands {
         /// run sanity checks during calculations (safe or unsafe)
         #[arg(long, default_value = "safe")]
         check_mode: CheckMode,
+        /// whether the accumulated are segments of a larger proof
+        #[arg(long, default_value = "false")]
+        split_proofs: bool,
     },
     /// Compiles a circuit from onnx to a simplified graph (einsum + other ops) and parameters as sets of field elements
     #[command(arg_required_else_help = true)]
-    CompileModel {
+    CompileCircuit {
         /// The path to the .onnx model file
         #[arg(short = 'M', long)]
         model: PathBuf,
         /// The path to output the processed model
         #[arg(long)]
-        compiled_model: PathBuf,
+        compiled_circuit: PathBuf,
         /// The path to load circuit params from
         #[arg(short = 'S', long)]
         settings_path: PathBuf,
@@ -388,19 +384,19 @@ pub enum Commands {
     Setup {
         /// The path to the compiled model file
         #[arg(short = 'M', long)]
-        compiled_model: PathBuf,
+        compiled_circuit: PathBuf,
         /// The srs path
         #[arg(long)]
         srs_path: PathBuf,
-        /// The path to output the verfication key file
+        /// The path to output the verification key file
         #[arg(long, default_value = "vk.key")]
         vk_path: PathBuf,
         /// The path to output the proving key file
         #[arg(long, default_value = "pk.key")]
         pk_path: PathBuf,
-        /// The path to load circuit params from
-        #[arg(short = 'S', long)]
-        settings_path: PathBuf,
+        /// The graph witness (optional - used to override fixed values in the circuit)
+        #[arg(short = 'W', long)]
+        witness: Option<PathBuf>,
     },
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -412,24 +408,18 @@ pub enum Commands {
         witness: PathBuf,
         /// The path to the processed model file
         #[arg(short = 'M', long)]
-        compiled_model: PathBuf,
+        compiled_circuit: PathBuf,
         #[arg(
             long,
             require_equals = true,
             num_args = 0..=1,
-            default_value_t = TranscriptType::Blake,
+            default_value_t = TranscriptType::EVM,
             value_enum
         )]
         transcript: TranscriptType,
-        /// proving arguments
-        #[clap(flatten)]
-        args: RunArgs,
         /// number of fuzz iterations
         #[arg(long, default_value = "10")]
         num_runs: usize,
-        /// optional circuit params path (overrides any run args set)
-        #[arg(short = 'S', long)]
-        settings_path: Option<PathBuf>,
     },
     #[cfg(not(target_arch = "wasm32"))]
     SetupTestEVMData {
@@ -438,13 +428,10 @@ pub enum Commands {
         data: PathBuf,
         /// The path to the compiled model file
         #[arg(short = 'M', long)]
-        compiled_model: PathBuf,
-        /// The path to load circuit params from
-        #[arg(long)]
-        settings_path: PathBuf,
+        compiled_circuit: PathBuf,
         /// For testing purposes only. The optional path to the .json data file that will be generated that contains the OnChain data storage information
         /// derived from the file information in the data .json file.
-        ///  Should include both the network input (possibly private) and the network output (public input to the proof)
+        /// Should include both the network input (possibly private) and the network output (public input to the proof)
         #[arg(short = 'T', long)]
         test_data: PathBuf,
         /// RPC URL for an Ethereum node, if None will use Anvil but WON'T persist state
@@ -457,6 +444,29 @@ pub enum Commands {
         #[arg(long, default_value = "on-chain")]
         output_source: TestDataSource,
     },
+    #[cfg(not(target_arch = "wasm32"))]
+    TestUpdateAccountCalls {
+        /// The path to verfier contract's address
+        #[arg(long)]
+        addr: H160,
+        /// The path to the .json data file, which should include both the network input (possibly private) and the network output (public input to the proof)
+        #[arg(short = 'D', long)]
+        data: PathBuf,
+        /// RPC URL for an Ethereum node, if None will use Anvil but WON'T persist state
+        #[arg(short = 'U', long)]
+        rpc_url: Option<String>,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    /// Swaps the positions in the transcript that correspond to commitments
+    #[command(arg_required_else_help = true)]
+    SwapProofCommitments {
+        /// The path to the proof file
+        #[arg(short = 'P', long)]
+        proof_path: PathBuf,
+        /// The path to the witness file
+        #[arg(short = 'W', long)]
+        witness_path: PathBuf,
+    },
 
     #[cfg(not(target_arch = "wasm32"))]
     /// Loads model, data, and creates proof
@@ -467,7 +477,7 @@ pub enum Commands {
         witness: PathBuf,
         /// The path to the compiled model file
         #[arg(short = 'M', long)]
-        compiled_model: PathBuf,
+        compiled_circuit: PathBuf,
         /// The path to load the desired proving key file
         #[arg(long)]
         pk_path: PathBuf,
@@ -481,22 +491,10 @@ pub enum Commands {
             long,
             require_equals = true,
             num_args = 0..=1,
-            default_value_t = TranscriptType::Blake,
+            default_value_t = ProofType::Single,
             value_enum
         )]
-        transcript: TranscriptType,
-        /// The proving strategy
-        #[arg(
-            long,
-            require_equals = true,
-            num_args = 0..=1,
-            default_value_t = StrategyType::Single,
-            value_enum
-        )]
-        strategy: StrategyType,
-        /// The path to load circuit params from
-        #[arg(short = 'S', long)]
-        settings_path: PathBuf,
+        proof_type: ProofType,
         /// run sanity checks during calculations (safe or unsafe)
         #[arg(long, default_value = "safe")]
         check_mode: CheckMode,
@@ -511,7 +509,7 @@ pub enum Commands {
         /// The path to load circuit settings from
         #[arg(short = 'S', long)]
         settings_path: PathBuf,
-        /// The path to load the desired verfication key file
+        /// The path to load the desired verification key file
         #[arg(long)]
         vk_path: PathBuf,
         /// The path to output the Solidity code
@@ -523,15 +521,15 @@ pub enum Commands {
     },
     #[cfg(not(target_arch = "wasm32"))]
     /// Creates an EVM verifier that attests to on-chain inputs for a single proof
-    #[command(name = "create-evm-da-verifier", arg_required_else_help = true)]
-    CreateEVMDataAttestationVerifier {
+    #[command(name = "create-evm-da", arg_required_else_help = true)]
+    CreateEVMDataAttestation {
         /// The path to load the desired srs file from
         #[arg(long)]
         srs_path: PathBuf,
         /// The path to load circuit settings from
         #[arg(short = 'S', long)]
         settings_path: PathBuf,
-        /// The path to load the desired verfication key file
+        /// The path to load the desired verification key file
         #[arg(long)]
         vk_path: PathBuf,
         /// The path to output the Solidity code
@@ -541,7 +539,7 @@ pub enum Commands {
         #[arg(long, default_value = "verifier_da_abi.json")]
         abi_path: PathBuf,
         /// The path to the .json data file, which should
-        /// contain the necessary calldata and accoount addresses  
+        /// contain the necessary calldata and accoount addresses
         /// needed need to read from all the on-chain
         /// view functions that return the data that the network
         /// ingests as inputs.
@@ -557,7 +555,7 @@ pub enum Commands {
         /// The path to load the desired srs file from
         #[arg(long)]
         srs_path: PathBuf,
-        /// The path to output to load the desired verfication key file
+        /// The path to output to load the desired verification key file
         #[arg(long)]
         vk_path: PathBuf,
         /// The path to the Solidity code
@@ -579,7 +577,7 @@ pub enum Commands {
         /// The path to the proof file
         #[arg(long)]
         proof_path: PathBuf,
-        /// The path to output the desired verfication key file (optional)
+        /// The path to output the desired verification key file (optional)
         #[arg(long)]
         vk_path: PathBuf,
         /// The kzg srs path
@@ -592,7 +590,7 @@ pub enum Commands {
         /// The path to the proof file
         #[arg(long)]
         proof_path: PathBuf,
-        /// The path to output the desired verfication key file (optional)
+        /// The path to output the desired verification key file (optional)
         #[arg(long)]
         vk_path: PathBuf,
         /// The srs path
@@ -613,10 +611,16 @@ pub enum Commands {
         #[arg(long, default_value = "contract.address")]
         /// The path to output the contract address
         addr_path: PathBuf,
+        /// The optimizer runs to set on the verifier. (Lower values optimize for deployment, while higher values optimize for execution)
+        #[arg(long, default_value = "1")]
+        optimizer_runs: usize,
+        /// Private secp256K1 key in hex format, 64 chars, no 0x prefix, of the account signing transactions. If None the private key will be generated by Anvil
+        #[arg(short = 'P', long)]
+        private_key: Option<String>,
     },
     #[cfg(not(target_arch = "wasm32"))]
-    #[command(name = "deploy-evm-da-verifier", arg_required_else_help = true)]
-    DeployEvmDataAttestationVerifier {
+    #[command(name = "deploy-evm-da", arg_required_else_help = true)]
+    DeployEvmDataAttestation {
         /// The path to the .json data file, which should include both the network input (possibly private) and the network output (public input to the proof)
         #[arg(short = 'D', long)]
         data: PathBuf,
@@ -632,6 +636,12 @@ pub enum Commands {
         #[arg(long, default_value = "contract_da.address")]
         /// The path to output the contract address
         addr_path: PathBuf,
+        /// The optimizer runs to set on the verifier. (Lower values optimize for deployment, while higher values optimize for execution)
+        #[arg(long, default_value = "1")]
+        optimizer_runs: usize,
+        /// Private secp256K1 key in hex format, 64 chars, no 0x prefix, of the account signing transactions. If None the private key will be generated by Anvil
+        #[arg(short = 'P', long)]
+        private_key: Option<String>,
     },
     #[cfg(not(target_arch = "wasm32"))]
     /// Verifies a proof using a local EVM executor, returning accept or reject
@@ -642,13 +652,13 @@ pub enum Commands {
         proof_path: PathBuf,
         /// The path to verfier contract's address
         #[arg(long)]
-        addr: H160,
+        addr_verifier: H160,
         /// RPC URL for an Ethereum node, if None will use Anvil but WON'T persist state
         #[arg(short = 'U', long)]
         rpc_url: Option<String>,
         /// does the verifier use data attestation ?
-        #[arg(long, default_value = "false")]
-        data_attestation: bool,
+        #[arg(long)]
+        addr_da: Option<H160>,
     },
 
     /// Print the proof in hexadecimal
@@ -657,5 +667,83 @@ pub enum Commands {
         /// The path to the proof file
         #[arg(long)]
         proof_path: PathBuf,
+    },
+
+    /// Gets credentials from the hub
+    #[command(name = "get-hub-credentials", arg_required_else_help = true)]
+    #[cfg(not(target_arch = "wasm32"))]
+    GetHubCredentials {
+        /// The user's api key
+        #[arg(short = 'K', long)]
+        api_key: Option<String>,
+        /// The path to the model file
+        #[arg(short = 'N', long)]
+        username: String,
+        /// The path to the input json file
+        #[arg(short = 'U', long)]
+        url: Option<String>,
+    },
+
+    /// Create artifacts and deploys them on the hub
+    #[command(name = "create-hub-artifact", arg_required_else_help = true)]
+    #[cfg(not(target_arch = "wasm32"))]
+    CreateHubArtifact {
+        /// The user's api key
+        #[arg(short = 'K', long)]
+        api_key: Option<String>,
+        /// The path to the model file
+        #[arg(short = 'M', long)]
+        uncompiled_circuit: PathBuf,
+        /// The path to the input json file
+        #[arg(short = 'D', long)]
+        data: PathBuf,
+        /// the hub's url
+        #[arg(short = 'O', long)]
+        organization_id: String,
+        ///artifact name
+        #[arg(short = 'A', long)]
+        artifact_name: String,
+        /// the hub's url
+        #[arg(short = 'U', long)]
+        url: Option<String>,
+        /// proving arguments
+        #[clap(flatten)]
+        args: RunArgs,
+        /// calibration target
+        #[arg(long, default_value = "resources")]
+        target: CalibrationTarget,
+    },
+
+    /// Create artifacts and deploys them on the hub
+    #[command(name = "prove-hub", arg_required_else_help = true)]
+    #[cfg(not(target_arch = "wasm32"))]
+    ProveHub {
+        /// The user's api key
+        #[arg(short = 'K', long)]
+        api_key: Option<String>,
+        /// The path to the model file
+        #[arg(short = 'A', long)]
+        artifact_id: String,
+        /// The path to the input json file
+        #[arg(short = 'D', long)]
+        data: PathBuf,
+        #[arg(short = 'U', long)]
+        url: Option<String>,
+        #[arg(short = 'T', long)]
+        transcript_type: Option<String>,
+    },
+
+    /// Create artifacts and deploys them on the hub
+    #[command(name = "get-hub-proof", arg_required_else_help = true)]
+    #[cfg(not(target_arch = "wasm32"))]
+    GetHubProof {
+        /// The user's api key
+        #[arg(short = 'K', long)]
+        api_key: Option<String>,
+        /// The path to the model file
+        #[arg(short = 'A', long)]
+        artifact_id: String,
+        #[arg(short = 'U', long)]
+        url: Option<String>,
     },
 }
