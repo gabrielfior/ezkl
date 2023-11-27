@@ -1,4 +1,4 @@
-use halo2_proofs::arithmetic::Field;
+use std::marker::PhantomData;
 use halo2_proofs::halo2curves::bn256::Fr as Fp;
 use halo2_proofs::{circuit::*, plonk::*};
 use zkevm_circuits::keccak_circuit::KeccakConfig as InnerConfig;
@@ -11,18 +11,37 @@ pub struct KeccakConfig<F> {
     ///
     pub instance: Option<Column<Instance>>,
     ///
-    pub pow5_config: InnerConfig<F>,
+    pub pow5_config: Pow5Config<Fp, WIDTH, RATE>,
 }
 
-impl<F> Module<Fp> for KeccakConfig<F> {
-    type Config = todo!();
+#[derive(Debug, Clone)]
+pub struct KeccakChip<
+    S: Spec<Fp, WIDTH, RATE> + Sync,
+    const WIDTH: usize,
+    const RATE: usize,
+    const L: usize,
+> {
+    config: KeccakConfig<WIDTH, RATE>,
+    _marker: PhantomData<S>,
+}
 
-    type InputAssignments = todo!();
+type InputAssignments = ();
 
-    type RunInputs = todo!();
+impl<S: Spec<Fp, WIDTH, RATE> + Sync, const WIDTH: usize, const RATE: usize, const L: usize>
+Module<Fp> for KeccakChip<S, WIDTH, RATE, L>
+{
+    type Config = KeccakConfig<WIDTH, RATE>;
+
+    type InputAssignments = InputAssignments;
+
+    type RunInputs = Vec<Fp>;
+    type Params = ();
 
     fn new(config: Self::Config) -> Self {
-        todo!()
+        Self {
+            config,
+            _marker: PhantomData
+        }
     }
 
     fn configure(meta: &mut ConstraintSystem<Fp>) -> Self::Config {
@@ -30,7 +49,7 @@ impl<F> Module<Fp> for KeccakConfig<F> {
     }
 
     fn name(&self) -> &'static str {
-        todo!()
+        "Keccak"
     }
 
     fn run(input: Self::RunInputs) -> Result<Vec<Vec<Fp>>, Box<dyn std::error::Error>> {
@@ -42,7 +61,7 @@ impl<F> Module<Fp> for KeccakConfig<F> {
         layouter: &mut impl Layouter<Fp>,
         input: &[crate::tensor::ValTensor<Fp>],
     ) -> Result<Self::InputAssignments, Error> {
-        todo!()
+        !todo!()
     }
 
     fn layout(
@@ -55,6 +74,10 @@ impl<F> Module<Fp> for KeccakConfig<F> {
     }
 
     fn instance_increment_input(&self) -> Vec<usize> {
+        todo!()
+    }
+
+    fn num_rows(input_len: usize) -> usize {
         todo!()
     }
 }

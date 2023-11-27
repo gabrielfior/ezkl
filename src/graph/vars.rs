@@ -38,6 +38,9 @@ pub enum Visibility {
     KZGCommit,
     /// Mark an item as encrypted (public key and encrypted message sent in the proof submitted for verificatio)
     Encrypted,
+    /// Mark an item as publicly committed to using keccak hashing (hash sent in the proof submitted for verification)
+    /// ToDo - Check if this overlaps with Hashed definition above.
+    Keccak,
     /// assigned as a constant in the circuit
     Fixed,
 }
